@@ -143,10 +143,15 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
     CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    // 使用 tensor core 执行 gemm 的时候，每个 thread 持有的 矩阵的 value 视图是 tCrA或者 tCrB
+    // 但是由于每个线程分到的 value 并不连续，直接按照这个 TV 视图来拷贝性能不佳
+    // 所以引入一个 copy 视图 smem_thr_copy，让每个线程拷贝连续 value 再分发到对应 thread 的 value 中
+    // 即 ldmatrix 指令
     Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // double buffer
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
     if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
     #pragma unroll
@@ -295,6 +300,7 @@ void cp_async_wait() {
 
 // resolves offset of a slice of a paged kv copy from gmem.
 // assumes that the tensor has already been positioned at the correct head.
+// TODO[shk]: 此函数需要修改
 template <typename Kernel_traits>
 __forceinline__ __device__
 int64_t resolve_thread_kv_page_slice_offset(
@@ -302,13 +308,13 @@ int64_t resolve_thread_kv_page_slice_offset(
     const int* block_table, const int page_stride, const int row_stride,
     std::optional<int> partial_block_size = std::nullopt
 ) {
-    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow;
-    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread;
-    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad;
+    constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow; // 每行 8 个 thread
+    constexpr int kGmemRowsPerThread = Kernel_traits::kGmemRowsPerThread; // 每个 thread 处理 8 个 row
+    constexpr int kGmemElemsPerLoad = Kernel_traits::kGmemElemsPerLoad; // 8
     constexpr int kBlockN = Kernel_traits::kBlockN;
     
-    const int64_t col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;
-    int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread;
+    const int64_t col_offset = tidx % kGmemThreadsPerRow * kGmemElemsPerLoad;  // 处理数据的行内偏移 （head_dim维度）
+    int64_t block_row_offset = tidx / kGmemThreadsPerRow * kGmemRowsPerThread; // 行偏移
 
     if (partial_block_size) {
         // if we have a partial block, we need to adjust the row offset to avoid
@@ -363,6 +369,7 @@ template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bo
 __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
                             Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
                             Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
+    // max_MN 即当前块内最大的 token offset
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -371,8 +378,10 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
     // There's no case where !Clear_OOB_K && Clear_OOB_MN
     static_assert(!(Clear_OOB_MN && !Clear_OOB_K));
     #pragma unroll
+    // 在 token 维度上迭代
     for (int m = 0; m < size<1>(S); ++m) {
         if (Is_even_MN || get<0>(identity_MN(0, m, 0)) < max_MN) {
+            // 仅在 token 没有超过最大 token offset 时
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
                 if (Is_even_K || predicate_K(k)) {

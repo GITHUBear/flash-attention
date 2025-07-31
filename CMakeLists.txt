@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(FA2_ENABLED ON)
+# set(FA3_ENABLED OFF)
 set(FA3_ENABLED ON)
 
 # CUDA by default, can be overridden by using -DVLLM_TARGET_DEVICE=... (used by setup.py)
@@ -106,6 +107,11 @@ endif ()
 #
 get_torch_gpu_compiler_flags(VLLM_FA_GPU_FLAGS ${VLLM_GPU_LANG})
 
+if (VLLM_FA_GPU_FLAGS STREQUAL "Debug")
+  list(APPEND VLLM_FA_GPU_FLAGS "-g")
+  list(APPEND VLLM_FA_GPU_FLAGS "-G")
+  list(APPEND VLLM_FA_GPU_FLAGS "-O0")
+endif()
 #
 # Set nvcc parallelism.
 #

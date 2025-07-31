@@ -29,3 +29,6 @@ var/
 
 # Dev
 venv
+.vscode/
+output_new.pt
+test_fa_kvcache.py

@@ -127,6 +127,7 @@ struct Flash_fwd_kernel_traits : public Base {
         SM80_CP_ASYNC_CACHEGLOBAL<cute::uint128_t>,
         AutoVectorizingCopyWithAssumedAlignment<128>
     >;
+    // 每个线程处理 16 字节
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(Copy_Atom<Gmem_copy_struct, Element>{},
                         GmemLayoutAtom{},

@@ -12,6 +12,11 @@ namespace FLASH_NAMESPACE {
 template<bool Varlen=true>
 struct BlockInfo {
 
+    // TODO[shk]:这个类需要修改
+    // Varlen = true
+    // cu_seqlens_q = nullptr
+    // cu_seqlens_k != nullptr
+    // is_seqlens_k_cumulative = false
     template<typename Params>
     __device__ BlockInfo(const Params &params, const int bidb)
         : sum_s_q(!Varlen || params.cu_seqlens_q == nullptr ? -1 : params.cu_seqlens_q[bidb])

@@ -77,9 +77,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         params.rng_state[1] = std::get<1>(seed_offset);
     }
 
+    // 提前终止
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
+    // 非 windows attn: n_block_min = 0
     const int n_block_min = !Is_local ? 0 : std::max(0, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = cute::ceil_div(binfo.actual_seqlen_k, kBlockN);
     if (Is_causal || Is_local) {
@@ -135,12 +137,15 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     const index_t row_offset_p = ((bidb * params.h + bidh) * params.seqlen_q_rounded
         + m_block * kBlockM) * params.seqlen_k_rounded + (n_block_max - 1) * kBlockN;
 
+    // 当前 batch 的 query (gmem)
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr)
                                           + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+    // 当前 batch 下当前 head 的 query tile 【kBlockM, kHeadDim】 tile索引是 （m_block, 0）(gmem)
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
+    // 
     Tensor mK = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.k_ptr)
                                           + binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_k, params.h_k, params.d),
@@ -581,7 +586,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // We move K and V to the last block.
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int *block_table = nullptr;
+    if (params.block_table || params.per_head_block_table) {
+        if (params.per_head_block_table && bidb < params.ph_block_table_batch_size) {
+            block_table = params.per_head_block_table + bidb * params.ph_block_table_batch_stride + 
+                          (bidh / params.h_h_k_ratio) * params.ph_block_table_head_stride;
+        } else {
+            block_table = params.block_table + bidb * params.block_table_batch_stride;
+        }
+    }
+    // const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
     const index_t row_offset_k = block_table == nullptr
         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
@@ -591,28 +605,44 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
           + (n_block_max - 1) * kBlockN * params.v_row_stride + (bidh / params.h_h_k_ratio) * params.v_head_stride
         : (bidh / params.h_h_k_ratio) * params.v_head_stride;
 
+    // 当前 batch_id 的 query (gmem ptr)
     Tensor mQ = make_tensor(make_gmem_ptr(reinterpret_cast<Element*>(params.q_ptr) + binfo.q_offset(params.q_batch_stride, params.q_row_stride, bidb)),
                             make_shape(binfo.actual_seqlen_q, params.h, params.d),
                             make_stride(params.q_row_stride, params.q_head_stride, _1{}));
+    // 当前 batch_id、head_id 下的 query，按照 kBlockM,kHeadDim 大小分块，取当前 m_block 索引的分块 (gmem_ptr)
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
+    // 指向当前 query head 对应的 key head id 的 key，按照 kBlockN,kHeadDim 大小分块
     Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.k_row_stride, _1{}));
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("k_ptr = %p, row_offset_k = %d, gK_ptr = %p\n", params.k_ptr, row_offset_k, gK.data()); }
+    // 同理
     Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
 
+    // using SmemLayoutAtomQ = decltype(
+    //   composition(Swizzle<kSwizzle, 3, 3>{},
+    //                 Layout<Shape<_8, Int<kBlockKSmem>>,
+    //                        Stride<Int<kBlockKSmem>, _1>>{}));
+    // using SmemLayoutQ = decltype(tile_to_shape(
+    //     SmemLayoutAtomQ{},
+    //     Shape<Int<kBlockM>, Int<kHeadDim>>{}));
+    // 用 8 * 64 的 atom 块平铺 64 * 128 的 Query smem 空间
     Tensor sQ = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_)),
                             typename Kernel_traits::SmemLayoutQ{});
+    // 用 8 * 64 的 atom 块平铺 128 * 128 的 KV smem 空间
     Tensor sK = make_tensor(sQ.data() + size(sQ), typename Kernel_traits::SmemLayoutKV{});
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
+    // V smem 空间的转置视图
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
 
+    // thread: 16 * 8 每个 thread 1 * 8  value: 16 * 64
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_Q;
     auto gmem_thr_copy_Q = gmem_tiled_copy_Q.get_thread_slice(tidx);
+    // thread: 16 * 8  每个 thread 8 * 8  value: 128 * 64
     typename Kernel_traits::GmemTiledCopyQKVPaged gmem_tiled_copy_KV;
     auto gmem_thr_copy_KV = gmem_tiled_copy_KV.get_thread_slice(tidx);
 
@@ -624,6 +654,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor tVgV_ = gmem_thr_copy_KV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K)
     Tensor tVsV_ = gmem_thr_copy_KV.partition_D(sV);
 
+    // reshape_thread_tile 正确的原因是因为一定能保证 KCPY_N  VCPY_N == 1
     Tensor tKgK = make_tensor(tKgK_.data(), reshape_thread_tile(tKgK_.layout()));
     Tensor tKsK = make_tensor(tKsK_.data(), reshape_thread_tile(tKsK_.layout()));
     Tensor tVgV = make_tensor(tVgV_.data(), reshape_thread_tile(tVgV_.layout()));
@@ -648,7 +679,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     //
     // Copy Atom retiling
     //
-
+    // 根据 tiled_mma 配置 获取每个 thread、value 布局
     auto smem_tiled_copy_Q = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtom{}, tiled_mma);
     auto smem_thr_copy_Q = smem_tiled_copy_Q.get_thread_slice(tidx);
     Tensor tSsQ = smem_thr_copy_Q.partition_S(sQ);
@@ -807,6 +838,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // Read Q from gmem to smem, optionally apply rotary embedding.
     if (!Append_KV || params.rotary_dim == 0) {
         // We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
+        // 将 Q 分块拷贝到 smem （cQ 和 pQ 主要用于处理边界条件，cQ 处理 token 维度超过 actual_seqlen_q，pQ 处理 head_dim 维度超过实际 param.d 的情况）
         FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_Q, tQgQ, tQsQ, tQcQ, tQpQ,
                                                      binfo.actual_seqlen_q - m_block * kBlockM);
     } else {
@@ -848,6 +880,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     int n_block = n_block_max - 1;
     // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+    // 将 K 分块拷贝到 smem
     FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
                                                  binfo.actual_seqlen_k - n_block * kBlockN);
     cute::cp_async_fence();
@@ -859,6 +892,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
+    // 维护 max(QK) 和 l = sum(exp(mi - m)), 乘以2应该是维护了 前一次和当前的分块的结果
     FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
@@ -879,19 +913,23 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     for (int masking_step = 0; masking_step < n_masking_steps; ++masking_step, --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
+        // 等待异步的 Q/K 拷贝完成
         FLASH_NAMESPACE::cp_async_wait<0>();
         __syncthreads();
 
         // Advance gV
         if (masking_step > 0) {
             if (block_table == nullptr) {
+                // 下一个 kBlockN
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
                 tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
                     block_table, params.v_batch_stride, params.v_row_stride);
             }
+            // 异步拷贝 V 到 smem
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
         } else {
+            // 拷贝 V
             // Clear the smem tiles to account for predicated off loads
             FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
                 gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
@@ -899,6 +937,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
         cute::cp_async_fence();
 
+        // sK 拷贝到寄存器 rK， sQ 拷贝到寄存器 rQ 计算 acc_s = tSrQ * tSrK
         FLASH_NAMESPACE::gemm(
             acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
             smem_thr_copy_Q, smem_thr_copy_K
@@ -921,6 +960,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         if (n_block > n_block_min) {
             // Advance gK
             if (block_table == nullptr) {
+                // 拷贝下一个 K tile
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 

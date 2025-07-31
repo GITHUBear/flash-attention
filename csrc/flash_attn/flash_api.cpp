@@ -1231,6 +1231,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
                 std::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
                 std::optional<const at::Tensor> &leftpad_k_, // batch_size
+                std::optional<at::Tensor> &per_head_block_table_, // batch_size1 x num_heads x head_size
                 std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
                 std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
                 std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
@@ -1240,7 +1241,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_right,
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                int actual_max_num_blocks_per_seq
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1262,10 +1264,18 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(kcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
     TORCH_CHECK(vcache.stride(-1) == 1, "Input tensor must have contiguous last dimension");
 
+    at::Tensor per_head_block_table;
     at::Tensor block_table;
+    const bool use_per_head_block_table = per_head_block_table_.has_value();
     const bool paged_KV = block_table_.has_value();
     if (paged_KV) {
         TORCH_CHECK(!cache_batch_idx_.has_value(), "Paged KVcache does not support cache_batch_idx");
+        if (use_per_head_block_table) {
+            per_head_block_table = per_head_block_table_.value();
+            CHECK_DEVICE(per_head_block_table);
+            TORCH_CHECK(per_head_block_table.dtype() == torch::kInt32, "per_head_block_table must have dtype torch.int32");
+            TORCH_CHECK(per_head_block_table.stride(-1) == 1, "per_head_block_table must have contiguous last dimension");
+        }
         block_table = block_table_.value();
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
@@ -1281,7 +1291,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     const int seqlen_q_og = seqlen_q;
     const int num_heads_og = num_heads;
 
-    const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
+    const int batch_size_use_per_head_block_table = !(paged_KV && use_per_head_block_table) ? 0 : per_head_block_table.size(0);
+    TORCH_CHECK(batch_size_use_per_head_block_table <= batch_size, "batch size to use per_head_block_table must less than total batch size");
+    const int max_num_blocks_per_seq = !paged_KV ? 0 : (use_per_head_block_table ? actual_max_num_blocks_per_seq : block_table.size(1));
     const int num_blocks = !paged_KV ? 0 : kcache.size(0);
     const int page_block_size = !paged_KV ? 1 : kcache.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
@@ -1316,7 +1328,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     } else {
         CHECK_SHAPE(kcache, num_blocks, page_block_size, num_heads_k, head_size_og);
         CHECK_SHAPE(vcache, num_blocks, page_block_size, num_heads_k, head_size_og);
-        CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+        // CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
     at::Tensor q_padded, kcache_padded, vcache_padded;
@@ -1465,6 +1477,7 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
+    // 对 kv 并行度进行划分
     std::tie(softmax_lse_accum, out_accum) = set_params_splitkv(
         params, batch_size, num_heads, head_size, seqlen_k, seqlen_q,
         head_size_rounded, /*dropout*/ 0.f, num_splits, get_num_sm(get_current_device()), opts);
@@ -1472,6 +1485,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
+        if (use_per_head_block_table) {
+            params.per_head_block_table = per_head_block_table.data_ptr<int>();
+            params.ph_block_table_batch_size = per_head_block_table.size(0);
+            params.ph_block_table_batch_stride = per_head_block_table.stride(0);
+            params.ph_block_table_head_stride = per_head_block_table.stride(1);
+        }
     }
     params.page_block_size = page_block_size;
 
