@@ -586,16 +586,13 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // We move K and V to the last block.
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const int *block_table = nullptr;
-    if (params.block_table || params.per_head_block_table) {
-        if (params.per_head_block_table && bidb < params.ph_block_table_batch_size) {
-            block_table = params.per_head_block_table + bidb * params.ph_block_table_batch_stride + 
-                          (bidh / params.h_h_k_ratio) * params.ph_block_table_head_stride;
-        } else {
-            block_table = params.block_table + bidb * params.block_table_batch_stride;
-        }
-    }
-    // const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int page_compress_cache_id = params.page_compress_cache_ids == nullptr ? -1 : (params.page_compress_cache_ids)[bidb];
+    const int num_compressed_page = params.num_compressed_pages == nullptr ? -1 : (params.num_compressed_pages)[bidb];
+    const int *page_compress_cache = params.page_compress_cache == nullptr ? nullptr : 
+                                    (page_compress_cache_id == -1 ? nullptr : 
+                                     params.page_compress_cache + page_compress_cache_id * params.page_compress_cache_blk_stride +
+                                     bidh * params.page_compress_cache_head_stride);
     const index_t row_offset_k = block_table == nullptr
         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
@@ -663,9 +660,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     if (block_table != nullptr) {
         auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
         tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
-            block_table, params.k_batch_stride, params.k_row_stride, final_block_size);
+            block_table, params.k_batch_stride, params.k_row_stride,
+            page_compress_cache, params.page_compress_topk, num_compressed_page, final_block_size);
         tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
-            block_table, params.v_batch_stride, params.v_row_stride, final_block_size);
+            block_table, params.v_batch_stride, params.v_row_stride,
+            page_compress_cache, params.page_compress_topk, num_compressed_page, final_block_size);
     }
 
     typename Kernel_traits::TiledMma tiled_mma;
@@ -823,9 +822,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             } else {
                 if (n_block > n_block_copy_min) {
                     tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
-                        block_table, params.v_batch_stride, params.v_row_stride);
+                        block_table, params.v_batch_stride, params.v_row_stride,
+                        page_compress_cache, params.page_compress_topk, num_compressed_page);
                     tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
-                        block_table, params.k_batch_stride, params.k_row_stride);
+                        block_table, params.k_batch_stride, params.k_row_stride,
+                        page_compress_cache, params.page_compress_topk, num_compressed_page);
                 }
             }
         }
@@ -924,7 +925,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
                 tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
-                    block_table, params.v_batch_stride, params.v_row_stride);
+                    block_table, params.v_batch_stride, params.v_row_stride,
+                    page_compress_cache, params.page_compress_topk, num_compressed_page);
             }
             // 异步拷贝 V 到 smem
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -964,7 +966,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
-                    block_table, params.k_batch_stride, params.k_row_stride);
+                    block_table, params.k_batch_stride, params.k_row_stride,
+                    page_compress_cache, params.page_compress_topk, num_compressed_page);
             }
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization
@@ -1004,7 +1007,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
         } else {
             tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
-                block_table, params.v_batch_stride, params.v_row_stride);
+                block_table, params.v_batch_stride, params.v_row_stride,
+                page_compress_cache, params.page_compress_topk, num_compressed_page);
         }
 
         FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
@@ -1026,7 +1030,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                 tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
             } else {
                 tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
-                    block_table, params.k_batch_stride, params.k_row_stride);            
+                    block_table, params.k_batch_stride, params.k_row_stride,
+                    page_compress_cache, params.page_compress_topk, num_compressed_page);            
             }
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
             // This cp_async_fence needs to be in the if block, otherwise the synchronization

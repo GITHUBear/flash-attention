@@ -291,8 +291,10 @@ def flash_attn_with_kvcache(
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     # [batch_size_to_use_per_head_block_table, num_q_head, max_block_count]
-    per_head_block_table: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
+    page_compress_cache: Optional[torch.Tensor] = None,
+    page_compress_cache_ids: Optional[torch.Tensor] = None,
+    num_compressed_pages: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
@@ -410,7 +412,6 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    per_head_block_table = maybe_contiguous(per_head_block_table)
 
     if fa_version == 2:
         if scheduler_metadata is not None and q_descale is not None \
@@ -427,8 +428,10 @@ def flash_attn_with_kvcache(
             rotary_sin,
             cache_batch_idx,
             cache_leftpad,
-            per_head_block_table,
             block_table,
+            page_compress_cache,
+            page_compress_cache_ids,
+            num_compressed_pages,
             alibi_slopes,
             out,
             softmax_scale,

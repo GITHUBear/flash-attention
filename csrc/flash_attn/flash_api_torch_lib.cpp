@@ -48,8 +48,10 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
                 std::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
                 std::optional<const at::Tensor> &leftpad_k_, // batch_size
-                std::optional<at::Tensor> &per_head_block_table_,
                 std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
+                std::optional<at::Tensor> &page_compress_cache_, // num_caches x num_heads_k x topk -> 稀疏页面 topk 缓存
+                std::optional<at::Tensor> &page_compress_cache_ids_, // batch_size -> 每个 seq 的稀疏页面 topk 缓存 id，如果尚未发生页面压缩，则填充 -1
+                std::optional<at::Tensor> &num_compressed_pages_,  // batch_size -> 每个 seq 已经将多少页面压缩成 topk 个页面，如果尚未发生页面压缩，则填充 -1
                 std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
                 std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
                 const float softmax_scale,
@@ -59,7 +61,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
                 int num_splits,
-                int actual_max_num_blocks_per_seq);
+                int actual_max_num_blocks_per_seq   // 页面压缩之后实际的最大 block 数量
+                );
 
 /////////////////////////// From flash_api_sparse.cpp //////////////////////////
 
@@ -116,7 +119,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 
     ops.def("fwd_kvcache(Tensor! q, Tensor kcache, Tensor vcache, Tensor? k, Tensor? v, Tensor? seqlens_k, "
             "Tensor? rotary_cos, Tensor? rotary_sin, Tensor? cache_batch_idx, Tensor? leftpad_k, "
-            "Tensor? per_head_block_table, Tensor? block_table, "
+            "Tensor? block_table, Tensor? page_compress_cache, Tensor? page_compress_cache_ids, "
+            "Tensor? num_compressed_pages, "
             "Tensor? alibi_slopes, Tensor!? out, float softmax_scale, bool is_causal, int window_size_left, "
             "int window_size_right, float softcap, bool is_rotary_interleaved, int num_splits, int actual_max_num_blocks_per_seq) -> Tensor[]");
     ops.impl("fwd_kvcache", torch::kCUDA, make_pytorch_shim(&mha_fwd_kvcache));
