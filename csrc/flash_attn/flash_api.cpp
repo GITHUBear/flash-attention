@@ -55,6 +55,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params = {};
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
+    params.is_kv_bf16 = k.dtype() == torch::kBFloat16 || k.dtype() == torch::kHalf;
 
     // Set the pointers and strides.
     params.q_ptr = q.data_ptr();
@@ -516,6 +517,8 @@ std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+               std::optional<at::Tensor> &k_descale_, 
+               std::optional<at::Tensor> &v_descale_,
                std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
@@ -543,10 +546,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_dtype = q.dtype();
+    auto k_dtype = k.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
-    TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    // TORCH_CHECK(k.dtype() == q_dtype, "query and key must have the same dtype");
+    // TORCH_CHECK(v.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(k.dtype() == v.dtype(), "key and value must have the same dtype");
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
@@ -699,6 +704,24 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         params.v_batch_stride = v.stride(0);
     }
     params.page_block_size = page_block_size;
+
+    if (k_dtype == at::ScalarType::Byte) { 
+        if (k_descale_.has_value()) {
+            auto k_descale = k_descale_.value();
+            CHECK_DEVICE(k_descale);
+            params.k_descale_ptr = k_descale.data_ptr<float>();
+        } else {
+            params.k_descale_ptr = nullptr;
+        }
+
+        if (v_descale_.has_value()) {
+            auto v_descale = v_descale_.value();
+            CHECK_DEVICE(v_descale);
+            params.v_descale_ptr = v_descale.data_ptr<float>();
+        } else {
+            params.v_descale_ptr = nullptr;
+        }
+    }
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
     if (seqlenq_ngroups_swapped) {
@@ -1224,6 +1247,8 @@ std::vector<at::Tensor>
 mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
                 const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                 const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                std::optional<at::Tensor> &k_descale_, 
+                std::optional<at::Tensor> &v_descale_,
                 std::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
                 std::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
                 std::optional<const at::Tensor> &seqlens_k_, // batch_size
@@ -1255,10 +1280,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
 
     auto q_dtype = q.dtype();
+    auto k_dtype = kcache.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
                 "FlashAttention only support fp16 and bf16 data type");
-    TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
-    TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    // TORCH_CHECK(kcache.dtype() == q_dtype, "query and key must have the same dtype");
+    // TORCH_CHECK(vcache.dtype() == q_dtype, "query and value must have the same dtype");
+    TORCH_CHECK(kcache.dtype() == vcache.dtype(), "key and value must have the same dtype");
 
     CHECK_DEVICE(q); CHECK_DEVICE(kcache); CHECK_DEVICE(vcache);
 
@@ -1517,6 +1544,23 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     }
     params.page_block_size = page_block_size;
 
+    if (k_dtype == at::ScalarType::Byte) { 
+        if (k_descale_.has_value()) {
+            auto k_descale = k_descale_.value();
+            CHECK_DEVICE(k_descale);
+            params.k_descale_ptr = k_descale.data_ptr<float>();
+        } else {
+            params.k_descale_ptr = nullptr;
+        }
+
+        if (v_descale_.has_value()) {
+            auto v_descale = v_descale_.value();
+            CHECK_DEVICE(v_descale);
+            params.v_descale_ptr = v_descale.data_ptr<float>();
+        } else {
+            params.v_descale_ptr = nullptr;
+        }
+    }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
 

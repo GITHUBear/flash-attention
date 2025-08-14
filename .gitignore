@@ -27,6 +27,9 @@ var/
 # IDE-related
 .idea/
 
+# vscode-related
+.vscode/
+
 # Dev
 venv
 .vscode/

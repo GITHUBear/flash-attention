@@ -226,6 +226,8 @@ def flash_attn_varlen_func(
                 )
         out, softmax_lse = torch.ops._vllm_fa2_C.varlen_fwd(
             q, k, v,
+            k_descale,
+            v_descale,
             out,
             cu_seqlens_q,
             # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp 
@@ -422,6 +424,7 @@ def flash_attn_with_kvcache(
                 )
         out, softmax_lse = torch.ops._vllm_fa2_C.fwd_kvcache(
             q, k_cache, v_cache,
+            k_descale, v_descale,
             k, v,             # k_new, v_new
             cache_seqlens,
             rotary_cos,

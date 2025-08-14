@@ -306,9 +306,9 @@ __forceinline__ __device__
 int64_t resolve_thread_kv_page_slice_offset(
     const int tidx, const int n_block, const int page_block_size, 
     const int* block_table, const int page_stride, const int row_stride,
-    const int *page_compress_cache,
-    const int page_compress_topk,
-    const int num_compressed_pages,
+    const int *page_compress_cache = nullptr,
+    const int page_compress_topk = -1,
+    const int num_compressed_pages = -1,
     std::optional<int> partial_block_size = std::nullopt
 ) {
     constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow; // 每行 8 个 thread
@@ -378,13 +378,13 @@ auto reshape_flatten_thread_tile(Layout<Shape, Stride> l) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true,
+template <bool Is_even_MN=true, bool Is_even_K=true, bool Clear_OOB_MN=false, bool Clear_OOB_K=true, bool Is_kv_bf16 = true,
           typename TiledCopy, typename Engine0, typename Layout0, typename Engine1, typename Layout1,
           typename Engine2, typename Layout2, typename Engine3, typename Layout3>
 __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layout0> const &S,
                             Tensor<Engine1, Layout1> &D, Tensor<Engine2, Layout2> const &identity_MN,
-                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0) {
-    // max_MN 即当前块内最大的 token offset
+                            Tensor<Engine3, Layout3> const &predicate_K, const int max_MN=0, float scale = 1.f) {
+    // max_MN 即当前块内最大的 token offset                           
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -400,7 +400,20 @@ __forceinline__ __device__ void copy(TiledCopy tiled_copy, Tensor<Engine0, Layou
             #pragma unroll
             for (int k = 0; k < size<2>(S); ++k) {
                 if (Is_even_K || predicate_K(k)) {
-                    cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                    if (Is_kv_bf16) {
+                        cute::copy(tiled_copy, S(_, m, k), D(_, m, k));
+                    } else {
+                        auto src_frag = S(_, m, k);    
+                        auto dst_frag = D(_, m, k);    
+                        #pragma unroll
+                        for (int idx = 0; idx < size(src_frag); ++idx) {
+                            auto crd = cute::idx2crd(idx, src_frag.shape());   
+                            uint8_t q = src_frag(crd);                  
+                            int8_t a = q - 128;
+                            float v   = a * scale;    
+                            dst_frag(crd) = static_cast<typename Engine1::value_type>(v); 
+                        }
+                    }
                 } else if (Clear_OOB_K) {
                     cute::clear(D(_, m, k));
                 }
