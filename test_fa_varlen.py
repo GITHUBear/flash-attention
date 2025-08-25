@@ -12,20 +12,15 @@ torch.set_default_device("cuda:0")
 random.seed(0)
 torch.cuda.manual_seed_all(0)
 
-# seq_lens = [(1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632),
-#             (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632),
-#             (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632),
-#             (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632),
-#             (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632), (1, 1328), (1, 18), (1, 463), (1, 13228), (1, 180), (1, 4632)]
-all_non_compress = False
-seq_lens = [(1, 65536)] * 10
-num_heads = (8, 1)
+seq_lens = [(1, 5000), (32, 13234), (1, 1234), (1, 32000), (4, 32), (5, 4500), (1, 65536)]
+# seq_lens = [(1, 65536)] * 10
+num_heads = (8, 2)
 head_size = 128
 dtype = torch.float16
 num_blocks = 8192
 block_size = 16
 fa_version = 2
-# non_compress_p = 0
+
 num_page_compress_cache = 100
 page_compress_topk = 256
 
@@ -52,13 +47,14 @@ key_cache = torch.randn(num_blocks,
                         dtype=dtype)
 value_cache = torch.randn_like(key_cache)
 kv_lens_tensor = torch.tensor(kv_lens, dtype=torch.int32)
+query_lens_tensor = torch.tensor(query_lens, dtype=torch.int32)
+max_seqlen_q = max(query_lens)
 cu_query_lens = torch.tensor([0] + query_lens,
-                                 dtype=torch.int32).cumsum(dim=0,
-                                                           dtype=torch.int32)
+                             dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
 seqused_k = torch.tensor(kv_lens, dtype=torch.int32)
+max_seqlen_k = max(kv_lens)
 max_num_blocks_per_seq = (max_kv_len + block_size - 1) // block_size
-block_tables = torch.randint(0,
-                            num_blocks,
+block_tables = torch.randint(0, num_blocks,
                             (num_seqs, max_num_blocks_per_seq),
                             dtype=torch.int32)
 print("block table:")
@@ -70,14 +66,13 @@ page_compress_cache = torch.randint(0, num_blocks,
                                     (num_page_compress_cache, num_kv_heads, page_compress_topk),
                                     dtype=torch.int32)
 print(f"page_compress_cache.shape: {page_compress_cache.shape}")
-if not all_non_compress:
-    page_compress_cache_ids_mask = (kv_lens_tensor <= page_compress_topk * block_size)
-    page_compress_cache_ids = torch.randint(0, num_page_compress_cache, (num_seqs,), dtype=torch.int32)
-    page_compress_cache_ids[page_compress_cache_ids_mask] = -1
-    page_compress_cache_ids_list = page_compress_cache_ids.tolist()
-else:
-    page_compress_cache_ids_list = [-1] * num_seqs
-    page_compress_cache_ids = torch.tensor(page_compress_cache_ids_list, dtype=torch.int32)
+
+page_compress_cache_ids_mask = (kv_lens_tensor < page_compress_topk * block_size)
+page_compress_cache_ids_mask2 = (query_lens_tensor > 1)
+page_compress_cache_ids = torch.randint(0, num_page_compress_cache, (num_seqs,), dtype=torch.int32)
+page_compress_cache_ids[page_compress_cache_ids_mask] = -1
+page_compress_cache_ids[page_compress_cache_ids_mask2] = -1
+page_compress_cache_ids_list = page_compress_cache_ids.tolist()
 print("page_compress_cache_ids: ")
 print(page_compress_cache_ids)
 print("page_compress_cache_ids shape: ")
@@ -104,8 +99,8 @@ for cache_id, n_cprs, kv_len in zip(page_compress_cache_ids_list, num_compressed
     else:
         new_kv_lens.append(kv_len - n_cprs * block_size + page_compress_topk * block_size)
 actual_max_kv_len = max(new_kv_lens)
-actual_max_num_blocks_per_seq = (actual_max_kv_len + block_size - 1) // block_size
 new_kv_lens = torch.tensor(new_kv_lens, dtype=torch.int32)
+new_kv_lens_list = new_kv_lens.tolist()
 print("new_kv_lens: ")
 print(new_kv_lens)
 print("new_kv_lens shape: ")
@@ -118,139 +113,133 @@ end_event1 = torch.cuda.Event(enable_timing=True)
 start_event2 = torch.cuda.Event(enable_timing=True)
 end_event2 = torch.cuda.Event(enable_timing=True)
 
-std_output = torch.zeros_like(query).unsqueeze(1)
+std_output = torch.zeros_like(query)
 group_size = num_query_heads // num_kv_heads
 start_event1.record()
 for _ in range(repeat_times):
     for bid in range(num_seqs):
         for qhead_i in range(num_query_heads):
             kvhead_i = qhead_i // group_size
-            # 计算 block_table
             page_compress_cache_id = page_compress_cache_ids[bid].item()
+            qlen = query_lens[bid]
+            qoffset = cu_query_lens[bid].item()
+            single_query_cu_seqlen = torch.tensor([0, qlen], dtype=torch.int32)
             if page_compress_cache_id == -1:
-                block_table = block_tables[bid:bid+1, :]
-                flash_attn_with_kvcache(
-                    query[bid:bid+1, qhead_i:qhead_i+1, :].unsqueeze(1),
-                    key_cache[:, :, kvhead_i:kvhead_i+1, :],
-                    value_cache[:, :, kvhead_i:kvhead_i+1, :],
+                flash_attn_varlen_func(
+                    q=query[qoffset:qoffset+qlen, qhead_i:qhead_i+1, :],
+                    k=key_cache[:, :, kvhead_i:kvhead_i+1, :],
+                    v=value_cache[:, :, kvhead_i:kvhead_i+1, :],
+                    cu_seqlens_q=single_query_cu_seqlen,
+                    max_seqlen_q=qlen,
+                    seqused_k=new_kv_lens[bid:bid+1],
+                    max_seqlen_k=new_kv_lens_list[bid],
                     softmax_scale=scale,
                     causal=True,
-                    block_table=block_table,
-                    cache_seqlens=new_kv_lens[bid:bid+1],
+                    block_table=block_tables[bid:bid+1, :],
+                    out=std_output[qoffset:qoffset+qlen, qhead_i:qhead_i+1, :],
                     fa_version=fa_version,
-                    out=std_output[bid:bid+1, :, qhead_i:qhead_i+1, :]
                 )
             else:
-                # print("=================== use page_compress_cache ===================")
+                assert qlen == 1
                 num_cprs_page = num_compressed_pages[bid:bid+1].item()
                 compressed_page_ids = page_compress_cache[page_compress_cache_id, kvhead_i, :]
                 uncompressed_page_ids = block_tables[bid, num_cprs_page:]
-                # print(compressed_page_ids.shape)
-                # print(uncompressed_page_ids.shape)
                 new_block_table = torch.concat([compressed_page_ids, uncompressed_page_ids]).unsqueeze(0)
-                flash_attn_with_kvcache(
-                    query[bid:bid+1, qhead_i:qhead_i+1, :].unsqueeze(1),
-                    key_cache[:, :, kvhead_i:kvhead_i+1, :],
-                    value_cache[:, :, kvhead_i:kvhead_i+1, :],
+                flash_attn_varlen_func(
+                    q=query[qoffset:qoffset+1, qhead_i:qhead_i+1, :],
+                    k=key_cache[:, :, kvhead_i:kvhead_i+1, :],
+                    v=value_cache[:, :, kvhead_i:kvhead_i+1, :],
+                    cu_seqlens_q=single_query_cu_seqlen,
+                    max_seqlen_q=1,
+                    seqused_k=new_kv_lens[bid:bid+1],
+                    max_seqlen_k=new_kv_lens_list[bid],
                     softmax_scale=scale,
                     causal=True,
                     block_table=new_block_table,
-                    cache_seqlens=new_kv_lens[bid:bid+1],
+                    out=std_output[qoffset:qoffset+1, qhead_i:qhead_i+1, :],
                     fa_version=fa_version,
-                    out=std_output[bid:bid+1, :, qhead_i:qhead_i+1, :]
-                )
-
+                )    
 end_event1.record()
 torch.cuda.synchronize()
+print("std_output: ")
 print(std_output)
+print("std_output shape: ")
 print(std_output.shape)
 elapsed_time_ms = start_event1.elapsed_time(end_event1)
 print(f"torch cost: {elapsed_time_ms/10}ms")
 
-
-print(query.shape)
-print(num_compressed_pages.shape)
-print(page_compress_cache_ids.shape)
-print(page_compress_cache.shape)
+output_tmp = torch.zeros_like(query)
 for _ in range(repeat_times):
-    output = flash_attn_with_kvcache(
-        query.unsqueeze(1),
-        key_cache,
-        value_cache,
+    flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        max_seqlen_q=max_seqlen_q,
+        seqused_k=new_kv_lens,
+        max_seqlen_k=actual_max_kv_len,
         softmax_scale=scale,
         causal=True,
         block_table=block_tables,
         page_compress_cache=page_compress_cache,
         page_compress_cache_ids=page_compress_cache_ids,
         num_compressed_pages=num_compressed_pages,
-        cache_seqlens=new_kv_lens,
+        out=output_tmp,
         fa_version=fa_version,
-        actual_max_num_blocks_per_seq=actual_max_num_blocks_per_seq,
     )
 torch.cuda.synchronize()
 
+output = torch.zeros_like(query)
 start_event2.record()
 for _ in range(repeat_times):
-    output = flash_attn_with_kvcache(
-        query.unsqueeze(1),
-        key_cache,
-        value_cache,
+    flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        max_seqlen_q=max_seqlen_q,
+        seqused_k=new_kv_lens,
+        max_seqlen_k=actual_max_kv_len,
         softmax_scale=scale,
         causal=True,
         block_table=block_tables,
         page_compress_cache=page_compress_cache,
         page_compress_cache_ids=page_compress_cache_ids,
         num_compressed_pages=num_compressed_pages,
-        cache_seqlens=new_kv_lens,
+        out=output,
         fa_version=fa_version,
-        actual_max_num_blocks_per_seq=actual_max_num_blocks_per_seq,
     )
 end_event2.record()
 torch.cuda.synchronize()
+print("output: ")
 print(output)
+print("output shape: ")
 print(output.shape)
 elapsed_time_ms2 = start_event2.elapsed_time(end_event2)
 print(f"cuda cost: {elapsed_time_ms2/repeat_times}ms")
 
+# start_event3 = torch.cuda.Event(enable_timing=True)
+# end_event3 = torch.cuda.Event(enable_timing=True)
+# start_event3.record()
+# for _ in range(repeat_times):
+#     flash_attn_varlen_func(
+#         q=query,
+#         k=key_cache,
+#         v=value_cache,
+#         cu_seqlens_q=cu_query_lens,
+#         max_seqlen_q=max_seqlen_q,
+#         seqused_k=seqused_k,
+#         max_seqlen_k=max_seqlen_k,
+#         softmax_scale=scale,
+#         causal=True,
+#         block_table=block_tables,
+#         out=output_tmp,
+#         fa_version=fa_version,
+#     )
+# end_event3.record()
+# torch.cuda.synchronize()
+# elapsed_time_ms3 = start_event3.elapsed_time(end_event3)
+# print(f"origin cost: {elapsed_time_ms3/repeat_times}ms")
 
 print(torch.abs(output - std_output).max())
 print(torch.allclose(output, std_output, atol=3e-4))
-
-start_event3 = torch.cuda.Event(enable_timing=True)
-end_event3 = torch.cuda.Event(enable_timing=True)
-
-for _ in range(repeat_times):
-    flash_attn_with_kvcache(
-        query.unsqueeze(1),
-        key_cache,
-        value_cache,
-        softmax_scale=scale,
-        causal=True,
-        block_table=block_tables,
-        cache_seqlens=kv_lens_tensor,
-        fa_version=fa_version,
-        out=std_output
-    )
-torch.cuda.synchronize()
-
-print("==============================")
-start_event3.record()
-for _ in range(repeat_times):
-    flash_attn_with_kvcache(
-        query.unsqueeze(1),
-        key_cache,
-        value_cache,
-        softmax_scale=scale,
-        causal=True,
-        block_table=block_tables,
-        cache_seqlens=kv_lens_tensor,
-        fa_version=fa_version,
-        out=std_output
-    )
-end_event3.record()
-torch.cuda.synchronize()
-elapsed_time_ms3 = start_event3.elapsed_time(end_event3)
-print(f"origin cost: {elapsed_time_ms3/repeat_times}ms")
-if all_non_compress:
-    print(torch.abs(output - std_output).max())
-    print(torch.allclose(output, std_output, atol=3e-4))

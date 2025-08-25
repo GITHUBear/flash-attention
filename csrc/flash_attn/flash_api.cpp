@@ -522,6 +522,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
                std::optional<const at::Tensor> &leftpad_k_, // batch_size
                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
+               std::optional<at::Tensor> &page_compress_cache_, // num_caches x num_heads_k x topk -> 稀疏页面 topk 缓存
+               std::optional<at::Tensor> &page_compress_cache_ids_, // batch_size -> 每个 seq 的稀疏页面 topk 缓存 id，如果尚未发生页面压缩，则填充 -1
+               std::optional<at::Tensor> &num_compressed_pages_,  // batch_size -> 每个 seq 已经将多少页面压缩成 topk 个页面，如果尚未发生页面压缩，则填充 -1
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
                const int max_seqlen_k,
@@ -555,8 +558,35 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     CHECK_DEVICE(cu_seqlens_k);
 
     at::Tensor block_table;
+    at::Tensor page_compress_cache;
+    at::Tensor page_compress_cache_ids;
+    at::Tensor num_compressed_pages;
+    const bool enable_page_compress = page_compress_cache_.has_value();
     const bool paged_KV = block_table_.has_value();
+
+    const auto sizes = q.sizes();
+    const int batch_size = cu_seqlens_q.numel() - 1;
     if (paged_KV) {
+        if (enable_page_compress) {
+            page_compress_cache = page_compress_cache_.value();
+            CHECK_DEVICE(page_compress_cache);
+            TORCH_CHECK(page_compress_cache.dtype() == torch::kInt32, "page_compress_cache must have dtype torch.int32");
+            TORCH_CHECK(page_compress_cache.stride(-1) == 1, "page_compress_cache must have contiguous last dimension");
+
+            TORCH_CHECK(page_compress_cache_ids_.has_value(), "page_compress_cache_ids_ is necessary when enable_page_compress");
+            page_compress_cache_ids = page_compress_cache_ids_.value();
+            CHECK_DEVICE(page_compress_cache_ids);
+            TORCH_CHECK(page_compress_cache_ids.dtype() == torch::kInt32, "page_compress_cache_ids must have dtype torch.int32");
+            CHECK_SHAPE(page_compress_cache_ids, batch_size);
+            TORCH_CHECK(page_compress_cache_ids.stride(-1) == 1, "page_compress_cache_ids must have contiguous last dimension");
+            
+            TORCH_CHECK(num_compressed_pages_.has_value(), "num_compressed_pages_ is necessary when enable_page_compress");
+            num_compressed_pages = num_compressed_pages_.value();
+            CHECK_DEVICE(num_compressed_pages);
+            TORCH_CHECK(num_compressed_pages.dtype() == torch::kInt32, "num_compressed_pages must have dtype torch.int32");
+            CHECK_SHAPE(num_compressed_pages, batch_size);
+            TORCH_CHECK(num_compressed_pages.stride(-1) == 1, "num_compressed_pages must have contiguous last dimension");
+        }
         block_table = block_table_.value();
         CHECK_DEVICE(block_table);
         TORCH_CHECK(block_table.dtype() == torch::kInt32, "block_table must have dtype torch.int32");
@@ -569,16 +599,16 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     CHECK_CONTIGUOUS(cu_seqlens_q);
     CHECK_CONTIGUOUS(cu_seqlens_k);
 
-    const auto sizes = q.sizes();
-
-    const int batch_size = cu_seqlens_q.numel() - 1;
     int num_heads = sizes[1];
     const int head_size = sizes[2];
     const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
+    if (paged_KV && enable_page_compress) {
+        TORCH_CHECK(page_compress_cache.size(1) == num_heads_k);
+    }
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
-    const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
+    // const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
     const int page_block_size = !paged_KV ? 1 : k.size(1);
     TORCH_CHECK(!paged_KV || page_block_size % 16 == 0, "Paged KV cache block size must be divisible by 16");
@@ -617,7 +647,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     } else {
         CHECK_SHAPE(k, num_blocks, page_block_size, num_heads_k, head_size);
         CHECK_SHAPE(v, num_blocks, page_block_size, num_heads_k, head_size);
-        CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
+        // CHECK_SHAPE(block_table, batch_size, max_num_blocks_per_seq);
     }
 
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
@@ -695,6 +725,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (paged_KV) {
         params.block_table = block_table.data_ptr<int>();
         params.block_table_batch_stride = block_table.stride(0);
+        if (enable_page_compress) {
+            params.page_compress_cache = page_compress_cache.data_ptr<int>();
+            params.page_compress_cache_ids = page_compress_cache_ids.data_ptr<int>();
+            params.num_compressed_pages = num_compressed_pages.data_ptr<int>();
+            params.page_compress_topk = page_compress_cache.size(2);
+            params.page_compress_cache_blk_stride = page_compress_cache.stride(0);
+            params.page_compress_cache_head_stride = page_compress_cache.stride(1);
+        }
         params.k_batch_stride = k.stride(0);
         params.v_batch_stride = v.stride(0);
     }
@@ -1408,6 +1446,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                      window_size_right,
                      softcap
                      );
+    if (paged_KV && enable_page_compress) {
+        TORCH_CHECK(params.h_h_k_ratio == 1);
+    }
 
     at::Tensor k, v, k_padded, v_padded;
     if (k_.has_value()) {

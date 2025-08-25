@@ -592,7 +592,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     const int *page_compress_cache = params.page_compress_cache == nullptr ? nullptr : 
                                     (page_compress_cache_id == -1 ? nullptr : 
                                      params.page_compress_cache + page_compress_cache_id * params.page_compress_cache_blk_stride +
-                                     bidh * params.page_compress_cache_head_stride);
+                                     (bidh / params.h_h_k_ratio) * params.page_compress_cache_head_stride);
     const index_t row_offset_k = block_table == nullptr
         ? binfo.k_offset(params.k_batch_stride, params.k_row_stride, bidb_cache)
           + (n_block_max - 1) * kBlockN * params.k_row_stride + (bidh / params.h_h_k_ratio) * params.k_head_stride
