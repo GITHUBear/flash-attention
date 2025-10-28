@@ -124,6 +124,7 @@ def flash_attn_varlen_func(
     cu_seqlens_q,
     max_seqlen_k,
     cu_seqlens_k=None, # only used for non-paged prefill
+    batch_idx_offset_for_blk_attn=None,
     seqused_k=None,
     q_v=None,
     dropout_p=0.0,
@@ -206,6 +207,8 @@ def flash_attn_varlen_func(
         "cu_seqlens_k and seqused_k cannot be provided at the same time"
     assert block_table is None or seqused_k is not None, \
         "seqused_k must be provided if block_table is provided"
+    assert batch_idx_offset_for_blk_attn is None or cu_seqlens_k is not None, \
+        "cu_seqlens_k must be provided if batch_idx_offset_for_blk_attn is provided"
     
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -234,6 +237,7 @@ def flash_attn_varlen_func(
             # cu_seqlens_k not used since we use seqused_k, but flash_api.cpp 
             # still wants it so we pass all zeros
             dummy_cu_seqlens_k if cu_seqlens_k is None else cu_seqlens_k,
+            batch_idx_offset_for_blk_attn,
             seqused_k,
             None,
             block_table,

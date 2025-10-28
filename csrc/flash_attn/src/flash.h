@@ -73,6 +73,7 @@ struct Flash_fwd_params : public Qkv_params {
     // array of length b+1 holding starting offset of each sequence.
     int * __restrict__ cu_seqlens_q;
     int * __restrict__ cu_seqlens_k;
+    int * __restrict__ batch_idx_offset_for_blk_attn;
     int * __restrict__ leftpad_k;
 
     // If provided, the actual length of each k sequence.

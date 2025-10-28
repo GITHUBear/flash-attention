@@ -49,7 +49,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
-                      const bool unpadded_lse=false) {
+                      const bool unpadded_lse=false,
+                      void *batch_idx_offset_for_blk_attn_d = nullptr) {
 
     // Reset the parameters
     params = {};
@@ -84,6 +85,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.cu_seqlens_q = static_cast<int *>(cu_seqlens_q_d);
     params.cu_seqlens_k = static_cast<int *>(cu_seqlens_k_d);
+    params.batch_idx_offset_for_blk_attn = static_cast<int *>(batch_idx_offset_for_blk_attn_d);
     params.seqused_k = static_cast<int *>(seqused_k);
 
     // P = softmax(QK^T)
@@ -519,6 +521,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
+               std::optional<at::Tensor> &batch_idx_offset_for_blk_attn, // b
                std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
                std::optional<const at::Tensor> &leftpad_k_, // batch_size
                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
@@ -660,6 +663,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(seqused_k_, batch_size);
     }
 
+    if (batch_idx_offset_for_blk_attn.has_value()) {
+        auto batch_idx_offset_for_blk_attn_ = batch_idx_offset_for_blk_attn.value();
+        TORCH_CHECK(batch_idx_offset_for_blk_attn_.dtype() == torch::kInt32, "batch_idx_offset_for_blk_attn must have dtype int32");
+        TORCH_CHECK(batch_idx_offset_for_blk_attn_.is_cuda(), "batch_idx_offset_for_blk_attn must be on CUDA device");
+        TORCH_CHECK(batch_idx_offset_for_blk_attn_.is_contiguous(), "batch_idx_offset_for_blk_attn must be contiguous");
+        CHECK_SHAPE(batch_idx_offset_for_blk_attn_, batch_size);
+    }
+
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -719,7 +730,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      window_size_right,
                      softcap,
                      seqlenq_ngroups_swapped,
-                     /*unpadded_lse*/true);
+                     /*unpadded_lse*/true,
+                     batch_idx_offset_for_blk_attn.has_value() ? batch_idx_offset_for_blk_attn.value().data_ptr() : nullptr);
     params.total_q = total_q;
 
     if (paged_KV) {

@@ -21,6 +21,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
+               std::optional<at::Tensor> &batch_idx_offset_for_blk_attn, // b
                std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
                std::optional<const at::Tensor> &leftpad_k_, // batch_size
                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
@@ -114,7 +115,7 @@ mha_varlen_fwd_sparse(at::Tensor &q,  // total_q x num_heads x head_size, total_
  */
 TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("varlen_fwd(Tensor! q, Tensor k, Tensor v, Tensor!? out, Tensor cu_seqlens_q, "
-            "Tensor cu_seqlens_k, Tensor? seqused_k, Tensor? leftpad_k, "
+            "Tensor cu_seqlens_k, Tensor? batch_idx_offset_for_blk_attn, Tensor? seqused_k, Tensor? leftpad_k, "
             "Tensor? block_table, Tensor? page_compress_cache, Tensor? page_compress_cache_ids, "
             "Tensor? num_compressed_pages, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "

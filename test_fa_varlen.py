@@ -12,9 +12,9 @@ torch.set_default_device("cuda:0")
 random.seed(0)
 torch.cuda.manual_seed_all(0)
 
-seq_lens = [(1, 5000), (32, 13234), (1, 1234), (1, 32000), (4, 32), (5, 4500), (1, 65536)]
-# seq_lens = [(1, 65536)] * 10
-num_heads = (8, 2)
+# seq_lens = [(1, 5000), (32, 13234), (1, 1234), (1, 32000), (4, 32), (5, 4500), (1, 65536)]
+seq_lens = [(1, 30000)] * 10
+num_heads = (5, 1)
 head_size = 128
 dtype = torch.float16
 num_blocks = 8192
@@ -218,28 +218,28 @@ print(output.shape)
 elapsed_time_ms2 = start_event2.elapsed_time(end_event2)
 print(f"cuda cost: {elapsed_time_ms2/repeat_times}ms")
 
-# start_event3 = torch.cuda.Event(enable_timing=True)
-# end_event3 = torch.cuda.Event(enable_timing=True)
-# start_event3.record()
-# for _ in range(repeat_times):
-#     flash_attn_varlen_func(
-#         q=query,
-#         k=key_cache,
-#         v=value_cache,
-#         cu_seqlens_q=cu_query_lens,
-#         max_seqlen_q=max_seqlen_q,
-#         seqused_k=seqused_k,
-#         max_seqlen_k=max_seqlen_k,
-#         softmax_scale=scale,
-#         causal=True,
-#         block_table=block_tables,
-#         out=output_tmp,
-#         fa_version=fa_version,
-#     )
-# end_event3.record()
-# torch.cuda.synchronize()
-# elapsed_time_ms3 = start_event3.elapsed_time(end_event3)
-# print(f"origin cost: {elapsed_time_ms3/repeat_times}ms")
+start_event3 = torch.cuda.Event(enable_timing=True)
+end_event3 = torch.cuda.Event(enable_timing=True)
+start_event3.record()
+for _ in range(repeat_times):
+    flash_attn_varlen_func(
+        q=query,
+        k=key_cache,
+        v=value_cache,
+        cu_seqlens_q=cu_query_lens,
+        max_seqlen_q=max_seqlen_q,
+        seqused_k=seqused_k,
+        max_seqlen_k=max_seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        block_table=block_tables,
+        out=output_tmp,
+        fa_version=fa_version,
+    )
+end_event3.record()
+torch.cuda.synchronize()
+elapsed_time_ms3 = start_event3.elapsed_time(end_event3)
+print(f"origin cost: {elapsed_time_ms3/repeat_times}ms")
 
 print(torch.abs(output - std_output).max())
 print(torch.allclose(output, std_output, atol=3e-4))

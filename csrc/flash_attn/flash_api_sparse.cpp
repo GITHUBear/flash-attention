@@ -49,7 +49,8 @@ void set_params_fprop(Flash_fwd_params &params,
                       int window_size_right,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
-                      const bool unpadded_lse=false);
+                      const bool unpadded_lse=false,
+                      void *batch_idx_offset_for_blk_attn_d = nullptr);
 
 std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, const int batch_size,
     const int num_heads, const int head_size, const int max_seqlen_k, const int max_seqlen_q,
