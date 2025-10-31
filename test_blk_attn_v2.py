@@ -13,7 +13,7 @@ torch.cuda.manual_seed_all(0)
 
 doc_len = 1000
 num_doc = 10
-batch_size = 1
+batch_size = 10
 seq_lens = [[20] + [doc_len] * num_doc + [20]] * batch_size
 print(seq_lens)
 batch_idx_offset_for_blk_attn = []
@@ -104,7 +104,7 @@ end_event1.record()
 torch.cuda.synchronize()
 elapsed_time_ms1 = start_event1.elapsed_time(end_event1)
 print(f"cuda cost: {elapsed_time_ms1/repeat_times}ms")
-print(output_tmp[0])
+# print(output_tmp[0])
 
 
 start_event2 = torch.cuda.Event(enable_timing=True)
@@ -191,9 +191,9 @@ for g in seq_lens:
         cur_batch_len += l
     batch_start += cur_batch_len
 
-print(output2[0])
-print("=====================")
-print(output[0])
+# print(output2[0])
+# print("=====================")
+# print(output[0])
 # print(query[0])
 
 print(torch.abs(output - output2).max())

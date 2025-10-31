@@ -586,7 +586,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // We move K and V to the last block.
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const int *block_table = params.block_table == nullptr ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int *block_table = (params.block_table == nullptr || binfo.force_use_local_kv) ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
     const int page_compress_cache_id = params.page_compress_cache_ids == nullptr ? -1 : (params.page_compress_cache_ids)[bidb];
     const int num_compressed_page = params.num_compressed_pages == nullptr ? -1 : (params.num_compressed_pages)[bidb];
     const int *page_compress_cache = params.page_compress_cache == nullptr ? nullptr : 
@@ -610,12 +610,12 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor gQ = local_tile(mQ(_, bidh, _), Shape<Int<kBlockM>, Int<kHeadDim>>{},
                            make_coord(m_block, 0));  // (kBlockM, kHeadDim)
     // 指向当前 query head 对应的 key head id 的 key，按照 kBlockN,kHeadDim 大小分块
-    Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.k_ptr) + row_offset_k),
+    Tensor gK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(binfo.force_use_local_kv ? params.local_k_ptr : params.k_ptr) + row_offset_k),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.k_row_stride, _1{}));
     // if (threadIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) { printf("k_ptr = %p, row_offset_k = %d, gK_ptr = %p\n", params.k_ptr, row_offset_k, gK.data()); }
     // 同理
-    Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.v_ptr) + row_offset_v),
+    Tensor gV = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(binfo.force_use_local_kv ? params.local_v_ptr : params.v_ptr) + row_offset_v),
                             Shape<Int<kBlockN>, Int<kHeadDim>>{},
                             make_stride(params.v_row_stride, _1{}));
 

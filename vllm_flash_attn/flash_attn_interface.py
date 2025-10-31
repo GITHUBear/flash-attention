@@ -139,6 +139,11 @@ def flash_attn_varlen_func(
     page_compress_cache: Optional[torch.Tensor] = None,
     page_compress_cache_ids: Optional[torch.Tensor] = None,
     num_compressed_pages: Optional[torch.Tensor] = None,
+    # For Block Attention:
+    local_key: Optional[torch.Tensor] = None,
+    local_value: Optional[torch.Tensor] = None,
+    local_cu_seqlen_k: Optional[torch.Tensor] = None,
+    ##
     return_softmax_lse=False,
     out=None,
     # FA3 Only
@@ -209,6 +214,10 @@ def flash_attn_varlen_func(
         "seqused_k must be provided if block_table is provided"
     assert batch_idx_offset_for_blk_attn is None or cu_seqlens_k is not None, \
         "cu_seqlens_k must be provided if batch_idx_offset_for_blk_attn is provided"
+    assert all([blk_attn_param is not None for blk_attn_param in (local_key, local_value, local_cu_seqlen_k)]) or \
+        all([blk_attn_param is None for blk_attn_param in (local_key, local_value, local_cu_seqlen_k)])
+    assert all([blk_attn_param is None for blk_attn_param in (local_key, local_value, local_cu_seqlen_k)]) or \
+        seqused_k is not None
     
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -244,6 +253,9 @@ def flash_attn_varlen_func(
             page_compress_cache,
             page_compress_cache_ids,
             num_compressed_pages,
+            local_key,
+            local_value,
+            local_cu_seqlen_k,
             alibi_slopes,
             max_seqlen_q,
             max_seqlen_k,

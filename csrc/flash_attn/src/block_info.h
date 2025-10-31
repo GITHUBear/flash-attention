@@ -22,15 +22,16 @@ struct BlockInfo {
     // seqlen_k_cache = params.cu_seqlens_k[bidb + 1] - params.cu_seqlens_k[bidb]
     template<typename Params>
     __device__ BlockInfo(const Params &params, const int bidb)
-        : sum_s_q(!Varlen || params.cu_seqlens_q == nullptr ? -1 : params.cu_seqlens_q[bidb])
-        , sum_s_k(!Varlen || params.cu_seqlens_k == nullptr || !params.is_seqlens_k_cumulative ? -1 : (params.batch_idx_offset_for_blk_attn == nullptr ? params.cu_seqlens_k[bidb] : params.cu_seqlens_k[bidb - params.batch_idx_offset_for_blk_attn[bidb]]))
+        : force_use_local_kv(Varlen && params.is_seqlens_k_cumulative && params.seqused_k && params.seqused_k[bidb] == -1 && params.local_cu_seqlen_k)
+        , sum_s_q(!Varlen || params.cu_seqlens_q == nullptr ? -1 : params.cu_seqlens_q[bidb])
+        , sum_s_k(!Varlen || params.cu_seqlens_k == nullptr || !params.is_seqlens_k_cumulative ? -1 :  (force_use_local_kv ? params.local_cu_seqlen_k[bidb] : (params.batch_idx_offset_for_blk_attn == nullptr ? params.cu_seqlens_k[bidb] : params.cu_seqlens_k[bidb - params.batch_idx_offset_for_blk_attn[bidb]])))
         , actual_seqlen_q(!Varlen || params.cu_seqlens_q == nullptr ? params.seqlen_q : params.cu_seqlens_q[bidb + 1] - sum_s_q)
         // If is_seqlens_k_cumulative, then seqlen_k is cu_seqlens_k[bidb + 1] - cu_seqlens_k[bidb].
         // Otherwise it's cu_seqlens_k[bidb], i.e., we use cu_seqlens_k to store the sequence lengths of K.
         , leftpad_k(params.leftpad_k == nullptr ? 0 : params.leftpad_k[bidb])
-        , seqlen_k_cache((!Varlen || params.cu_seqlens_k == nullptr ? params.seqlen_k : (params.is_seqlens_k_cumulative ? params.cu_seqlens_k[bidb + 1] - sum_s_k : params.cu_seqlens_k[bidb])) - leftpad_k)
+        , seqlen_k_cache((!Varlen || params.cu_seqlens_k == nullptr ? params.seqlen_k : (force_use_local_kv ? (params.local_cu_seqlen_k[bidb + 1] - sum_s_k) : (params.is_seqlens_k_cumulative ? params.cu_seqlens_k[bidb + 1] - sum_s_k : params.cu_seqlens_k[bidb]) )) - leftpad_k)
         // varlen forward 时 actual_seqlen_k 是 params.seqused_k[bidb]
-        , actual_seqlen_k(params.seqused_k ? params.seqused_k[bidb] - leftpad_k : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew))
+        , actual_seqlen_k((params.seqused_k && !force_use_local_kv) ? params.seqused_k[bidb] - leftpad_k : seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew))
         {
         }
 
@@ -44,6 +45,7 @@ struct BlockInfo {
         return sum_s_k == -1 ? bidb * batch_stride + leftpad_k * row_stride : uint32_t(sum_s_k + leftpad_k) * row_stride;
     }
 
+    bool force_use_local_kv;
     const int sum_s_q;
     const int sum_s_k;
     const int actual_seqlen_q;

@@ -50,7 +50,10 @@ void set_params_fprop(Flash_fwd_params &params,
                       const float softcap,
                       bool seqlenq_ngroups_swapped=false,
                       const bool unpadded_lse=false,
-                      void *batch_idx_offset_for_blk_attn_d = nullptr) {
+                      void *batch_idx_offset_for_blk_attn_d = nullptr,
+                      void *local_key_d = nullptr,
+                      void *local_value_d = nullptr,
+                      void *local_cu_seqlen_k = nullptr) {
 
     // Reset the parameters
     params = {};
@@ -157,6 +160,10 @@ void set_params_fprop(Flash_fwd_params &params,
 
     params.unpadded_lse = unpadded_lse;
     params.seqlenq_ngroups_swapped = seqlenq_ngroups_swapped;
+
+    params.local_k_ptr = local_key_d;
+    params.local_v_ptr = local_value_d;
+    params.local_cu_seqlen_k = static_cast<int *>(local_cu_seqlen_k);
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -528,6 +535,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &page_compress_cache_, // num_caches x num_heads_k x topk -> 稀疏页面 topk 缓存
                std::optional<at::Tensor> &page_compress_cache_ids_, // batch_size -> 每个 seq 的稀疏页面 topk 缓存 id，如果尚未发生页面压缩，则填充 -1
                std::optional<at::Tensor> &num_compressed_pages_,  // batch_size -> 每个 seq 已经将多少页面压缩成 topk 个页面，如果尚未发生页面压缩，则填充 -1
+               std::optional<at::Tensor> &local_key,    // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &local_value,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &local_cu_seqlen_k, // b+1
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
                const int max_seqlen_k,
@@ -671,6 +681,32 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(batch_idx_offset_for_blk_attn_, batch_size);
     }
 
+    if (local_key.has_value()) {
+        auto local_key_ = local_key.value();
+        TORCH_CHECK(paged_KV, "local_key only supports paged attention.");
+        const int total_local_k = local_key_.size(0);
+        CHECK_SHAPE(local_key_, total_local_k, num_heads_k, head_size);
+        TORCH_CHECK(local_key_.dtype() == q_dtype, "query and local_key must have the same dtype");
+        CHECK_DEVICE(local_key_);
+    }
+
+    if (local_value.has_value()) {
+        auto local_value_ = local_value.value();
+        TORCH_CHECK(paged_KV, "local_value only supports paged attention.");
+        const int total_local_v = local_value_.size(0);
+        CHECK_SHAPE(local_value_, total_local_v, num_heads_k, head_size);
+        TORCH_CHECK(local_value_.dtype() == q_dtype, "query and local_key must have the same dtype");
+        CHECK_DEVICE(local_value_);
+    }
+
+    if (local_cu_seqlen_k.has_value()) {
+        auto local_cu_seqlen_k_ = local_cu_seqlen_k.value();
+        TORCH_CHECK(local_cu_seqlen_k_.dtype() == torch::kInt32, "local_cu_seqlen_k must have dtype int32");
+        TORCH_CHECK(local_cu_seqlen_k_.is_cuda(), "local_cu_seqlen_k must be on CUDA device");
+        TORCH_CHECK(local_cu_seqlen_k_.is_contiguous(), "local_cu_seqlen_k must be contiguous");
+        CHECK_SHAPE(local_cu_seqlen_k_, batch_size + 1);
+    }
+
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -731,7 +767,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      softcap,
                      seqlenq_ngroups_swapped,
                      /*unpadded_lse*/true,
-                     batch_idx_offset_for_blk_attn.has_value() ? batch_idx_offset_for_blk_attn.value().data_ptr() : nullptr);
+                     batch_idx_offset_for_blk_attn.has_value() ? batch_idx_offset_for_blk_attn.value().data_ptr() : nullptr,
+                     local_key.has_value() ? local_key.value().data_ptr() : nullptr,
+                     local_value.has_value() ? local_value.value().data_ptr() : nullptr,
+                     local_cu_seqlen_k.has_value() ? local_cu_seqlen_k.value().data_ptr() : nullptr);
     params.total_q = total_q;
 
     if (paged_KV) {
