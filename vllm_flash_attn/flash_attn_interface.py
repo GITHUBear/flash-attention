@@ -143,6 +143,9 @@ def flash_attn_varlen_func(
     local_key: Optional[torch.Tensor] = None,
     local_value: Optional[torch.Tensor] = None,
     local_cu_seqlen_k: Optional[torch.Tensor] = None,
+    actual_chunked_seqlen_k: Optional[torch.Tensor] = None, # 倒序，如果为空，则每个 batch 默认分成一块，长度为 seqlen_k
+    chunk_rotray_offset_positions: Optional[torch.Tensor] = None, # 倒序，如果为空，则默认无需修正位置编码
+    cu_num_chunks_k: Optional[torch.Tensor] = None,
     ##
     return_softmax_lse=False,
     out=None,
@@ -218,6 +221,10 @@ def flash_attn_varlen_func(
         all([blk_attn_param is None for blk_attn_param in (local_key, local_value, local_cu_seqlen_k)])
     assert all([blk_attn_param is None for blk_attn_param in (local_key, local_value, local_cu_seqlen_k)]) or \
         seqused_k is not None
+    assert actual_chunked_seqlen_k is None or cu_num_chunks_k is not None, \
+        "cu_num_chunks_k must be provided if actual_chunked_seqlen_k is provided"
+    assert chunk_rotray_offset_positions is None or cu_num_chunks_k is not None, \
+        "cu_num_chunks_k must be provided if chunk_rotray_offset_positions is provided"
     
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -253,9 +260,14 @@ def flash_attn_varlen_func(
             page_compress_cache,
             page_compress_cache_ids,
             num_compressed_pages,
+            # For Block Attention
             local_key,
             local_value,
             local_cu_seqlen_k,
+            actual_chunked_seqlen_k,
+            chunk_rotray_offset_positions,
+            cu_num_chunks_k,
+            # 
             alibi_slopes,
             max_seqlen_q,
             max_seqlen_k,

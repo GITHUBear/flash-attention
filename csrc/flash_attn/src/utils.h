@@ -309,6 +309,7 @@ int64_t resolve_thread_kv_page_slice_offset(
     const int *page_compress_cache,
     const int page_compress_topk,
     const int num_compressed_pages,
+    const int init_global_row_offset = 0,
     std::optional<int> partial_block_size = std::nullopt
 ) {
     constexpr int kGmemThreadsPerRow = Kernel_traits::kGmemThreadsPerRow; // 每行 8 个 thread
@@ -332,7 +333,7 @@ int64_t resolve_thread_kv_page_slice_offset(
             block_row_offset, int64_t(final_thread_row_offset));
     }
 
-    const int64_t global_row_offset = block_row_offset + n_block * kBlockN;
+    const int64_t global_row_offset = init_global_row_offset + block_row_offset + n_block * kBlockN;
     const int64_t page_offset = global_row_offset % page_block_size;
     const int64_t virtual_page_idx = global_row_offset / page_block_size;
 

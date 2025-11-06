@@ -8,8 +8,8 @@ import torch
 import random
 
 torch.set_default_device("cuda:0")
-# random.seed(0)
-# torch.cuda.manual_seed_all(0)
+random.seed(0)
+torch.cuda.manual_seed_all(0)
 
 # doc_len = 1000
 # num_doc = 10
@@ -42,8 +42,8 @@ class DocParialCached:
 
 prefix_suffix_len = 20
 num_doc = 10
-batch_size = 10
-doc_len = 1000
+batch_size = 1
+doc_len = 100
 docs: list[DocParialCached] = []
 for _ in range(batch_size):
     docs.append(DocParialCached(num_doc=num_doc, doc_len=doc_len, prefix_suffix_len=prefix_suffix_len))
@@ -120,7 +120,7 @@ flash_attn_varlen_func(
     fa_version=fa_version,
 )
 torch.cuda.synchronize()
-# print(output_tmp)
+print(output_tmp)
 # print(output_tmp)
 
 
@@ -162,7 +162,7 @@ for bidx, flag in enumerate(use_block_table_mask):
             fa_version=fa_version,
         )
         torch.cuda.synchronize()
-# print(output)
+print(output)
         
 print(torch.abs(output - output_tmp).max())
 print(torch.allclose(output, output_tmp, atol=1e-3))

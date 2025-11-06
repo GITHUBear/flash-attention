@@ -28,9 +28,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &page_compress_cache_, // num_caches x num_heads_k x topk -> 稀疏页面 topk 缓存
                std::optional<at::Tensor> &page_compress_cache_ids_, // batch_size -> 每个 seq 的稀疏页面 topk 缓存 id，如果尚未发生页面压缩，则填充 -1
                std::optional<at::Tensor> &num_compressed_pages_,  // batch_size -> 每个 seq 已经将多少页面压缩成 topk 个页面，如果尚未发生页面压缩，则填充 -1
+
                std::optional<at::Tensor> &local_key,    // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                std::optional<at::Tensor> &local_value,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                std::optional<at::Tensor> &local_cu_seqlen_k, // b+1
+               std::optional<at::Tensor> &actual_chunked_seqlen_k, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
+               std::optional<at::Tensor> &chunk_rotray_offset_positions, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
+               std::optional<at::Tensor> &cu_num_chunks_k,  // b+1
+
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
                const int max_seqlen_k,
@@ -120,7 +125,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
     ops.def("varlen_fwd(Tensor! q, Tensor k, Tensor v, Tensor!? out, Tensor cu_seqlens_q, "
             "Tensor cu_seqlens_k, Tensor? batch_idx_offset_for_blk_attn, Tensor? seqused_k, Tensor? leftpad_k, "
             "Tensor? block_table, Tensor? page_compress_cache, Tensor? page_compress_cache_ids, "
-            "Tensor? num_compressed_pages, Tensor? local_key, Tensor? local_value, Tensor? local_cu_seqlen_k, Tensor? alibi_slopes, "
+            "Tensor? num_compressed_pages, Tensor? local_key, Tensor? local_value, Tensor? local_cu_seqlen_k, "
+            "Tensor? actual_chunked_seqlen_k, Tensor? chunk_rotray_offset_positions, Tensor? cu_num_chunks_k, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
             "Generator? gen) -> Tensor[]");

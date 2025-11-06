@@ -322,7 +322,13 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-            params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+            if (params.actual_chunked_seqlen_k != nullptr) {
+                // 设置分块 block attention 时，暂时不开启 splitKV 特性
+                // TODO[shk]:待优化
+                params.num_splits = 0;
+            } else {
+                params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+            }
         }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
@@ -535,9 +541,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &page_compress_cache_, // num_caches x num_heads_k x topk -> 稀疏页面 topk 缓存
                std::optional<at::Tensor> &page_compress_cache_ids_, // batch_size -> 每个 seq 的稀疏页面 topk 缓存 id，如果尚未发生页面压缩，则填充 -1
                std::optional<at::Tensor> &num_compressed_pages_,  // batch_size -> 每个 seq 已经将多少页面压缩成 topk 个页面，如果尚未发生页面压缩，则填充 -1
+            // For Block Attention
                std::optional<at::Tensor> &local_key,    // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                std::optional<at::Tensor> &local_value,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                std::optional<at::Tensor> &local_cu_seqlen_k, // b+1
+               std::optional<at::Tensor> &actual_chunked_seqlen_k, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
+               std::optional<at::Tensor> &chunk_rotray_offset_positions, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
+               std::optional<at::Tensor> &cu_num_chunks_k,  // b+1
+            // 
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
                const int max_seqlen_k,
@@ -707,6 +718,28 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(local_cu_seqlen_k_, batch_size + 1);
     }
 
+    if (actual_chunked_seqlen_k.has_value()) {
+        auto actual_chunked_seqlen_k_ = actual_chunked_seqlen_k.value();
+        TORCH_CHECK(actual_chunked_seqlen_k_.dtype() == torch::kInt32, "actual_chunked_seqlen_k must have dtype int32");
+        TORCH_CHECK(actual_chunked_seqlen_k_.is_cuda(), "actual_chunked_seqlen_k must be on CUDA device");
+        TORCH_CHECK(actual_chunked_seqlen_k_.is_contiguous(), "actual_chunked_seqlen_k must be contiguous");
+    }
+
+    if (chunk_rotray_offset_positions.has_value()) {
+        auto chunk_rotray_offset_positions_ = chunk_rotray_offset_positions.value();
+        TORCH_CHECK(chunk_rotray_offset_positions_.dtype() == torch::kInt32, "chunk_rotray_offset_positions must have dtype int32");
+        TORCH_CHECK(chunk_rotray_offset_positions_.is_cuda(), "chunk_rotray_offset_positions must be on CUDA device");
+        TORCH_CHECK(chunk_rotray_offset_positions_.is_contiguous(), "chunk_rotray_offset_positions must be contiguous");
+    }
+
+    if (cu_num_chunks_k.has_value()) {
+        auto cu_num_chunks_k_ = cu_num_chunks_k.value();
+        TORCH_CHECK(cu_num_chunks_k_.dtype() == torch::kInt32, "cu_num_chunks_k must have dtype int32");
+        TORCH_CHECK(cu_num_chunks_k_.is_cuda(), "cu_num_chunks_k must be on CUDA device");
+        TORCH_CHECK(cu_num_chunks_k_.is_contiguous(), "cu_num_chunks_k must be contiguous");
+        CHECK_SHAPE(cu_num_chunks_k_, batch_size + 1);
+    }
+
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -771,6 +804,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                      local_key.has_value() ? local_key.value().data_ptr() : nullptr,
                      local_value.has_value() ? local_value.value().data_ptr() : nullptr,
                      local_cu_seqlen_k.has_value() ? local_cu_seqlen_k.value().data_ptr() : nullptr);
+    params.actual_chunked_seqlen_k = actual_chunked_seqlen_k.has_value() ? static_cast<int *>(actual_chunked_seqlen_k.value().data_ptr()) : nullptr;
+    params.chunk_rotray_offset_positions = chunk_rotray_offset_positions.has_value() ? static_cast<int *>(chunk_rotray_offset_positions.value().data_ptr()) : nullptr;
+    params.cu_num_chunks_k = cu_num_chunks_k.has_value() ? static_cast<int *>(cu_num_chunks_k.value().data_ptr()) : nullptr;
     params.total_q = total_q;
 
     if (paged_KV) {
