@@ -11,18 +11,22 @@ torch.cuda.manual_seed_all(0)
 def ceil_div(a, b):
     return (a + b - 1) // b
 
-query_lens = [20, 10]
+query_lens = [30, 30, 30, 20, 100, 100, 10]
 # query_lens = [1]
 # query_lens = [20]
 batch_size = len(query_lens)
-kv_lens = [[103, 123, 84, 239, 943, 20],[800,31,10]]
+kv_lens = [[30], [30], [30], [103, 123, 84, 239, 943, 20], [100], [100], [800,31,10]]
 # kv_lens = [[1,1]]
 # kv_lens = [[103, 123, 84, 239, 943, 20]]
 # kv_lens = [[129, 20]]
-rotray_offsets = [[132,4,100,20, 1,0],[313, 1000, 0]]
+rotray_offsets = [[0], [0], [0], [132,4,100,20, 1,0], [0], [0], [313, 1000, 0]]
 # rotray_offsets = [[132,4,100,20, 1,0]]
 # rotray_offsets = [[1,0]]
 flattened_rotray_offsets = [offset for rotray_offset in rotray_offsets for offset in rotray_offset]
+batch_is_local = []
+for kv_len, q_len, rot_offset in zip(kv_lens, query_lens, rotray_offsets):
+    batch_is_local.append(len(kv_len) == 1 and kv_len[0] == q_len and len(rot_offset) == 1 and rot_offset[0] == 0)
+print(f"batch_is_local: {batch_is_local}")
 
 block_size = 16
 kv_lens_block_size_align = [[ceil_div(l, block_size)*block_size for l in kv_batch] for kv_batch in kv_lens]
@@ -32,7 +36,13 @@ total_kv_len_per_batch = [sum(kv_batch) for kv_batch in kv_lens]
 print(f"total_kv_len_per_batch:{total_kv_len_per_batch}")
 padded_kv_lens = [align_kv_len[:-1]+kv_len[-1:] for kv_len, align_kv_len in zip(kv_lens, kv_lens_block_size_align)]
 print(f"padded_kv_lens:{padded_kv_lens}")
-actual_kv_lens_for_blk_attn = [sum(kv_len) for kv_len in padded_kv_lens]
+# actual_kv_lens_for_blk_attn = [sum(kv_len) for kv_len in padded_kv_lens]
+actual_kv_lens_for_blk_attn = []
+for is_local, kv_len in zip(batch_is_local, padded_kv_lens):
+    if is_local:
+        actual_kv_lens_for_blk_attn.append(-1)
+    else:
+        actual_kv_lens_for_blk_attn.append(sum(kv_len))
 print(f"actual_kv_lens_for_blk_attn: {actual_kv_lens_for_blk_attn}")
 
 num_heads = (5, 1)
@@ -53,6 +63,12 @@ cu_query_lens = torch.tensor([0] + query_lens,
                                  dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
 max_query_len = max(query_lens)
 
+local_key = torch.randn(sum(query_lens),
+                    num_kv_heads,
+                    head_size,
+                    dtype=dtype)
+local_val = torch.rand_like(local_key)
+
 key = torch.randn(sum(total_kv_len_per_batch),
                     num_kv_heads,
                     head_size,
@@ -70,6 +86,7 @@ key_cache = torch.randn(num_blocks,
                         dtype=dtype)
 value_cache = torch.randn_like(key_cache)
 seqused_k = torch.tensor(actual_kv_lens_for_blk_attn, dtype=torch.int32)
+print(f"seqused_k: {seqused_k}")
 max_kv_len_for_blk_attn = max(actual_kv_lens_for_blk_attn)
 max_num_blocks_per_seq_for_blk_attn = (max(actual_kv_lens_for_blk_attn) + block_size - 1) // block_size
 num_blk_for_blk_attn = [[(l // block_size) for l in kv_len] for kv_len in kv_lens_block_size_align]
@@ -111,7 +128,7 @@ def apply_rotary_emb_torch(
     offset: int,
 ) -> torch.Tensor:
     cos_sin = cos_sin_cache[offset]
-    print(f"offset: {cos_sin}")
+    # print(f"offset: {cos_sin}")
     cos, sin = cos_sin.chunk(2, dim=-1)
     x1, x2 = torch.chunk(x, 2, dim=-1)
     o1 = x1 * cos - x2 * sin
@@ -119,8 +136,10 @@ def apply_rotary_emb_torch(
     return torch.cat((o1, o2), dim=-1)
 
 pre_kv_sum = 0
+local_kv_sum = 0
 for i in range(batch_size):
     pre_blk_cnt_sum = 0
+    tmp = pre_kv_sum
     for (kv_len, num_blk, roffset) in zip(kv_lens[i], num_blk_for_blk_attn[i], rotray_offsets[i]):
         blocks = block_tables[i][pre_blk_cnt_sum:pre_blk_cnt_sum+num_blk]
         if roffset != 0:
@@ -132,6 +151,12 @@ for i in range(batch_size):
 
         pre_kv_sum += kv_len
         pre_blk_cnt_sum += num_blk
+    
+    if batch_is_local[i]:
+        print(f"i:{i}:  {local_key.shape} query_lens:{query_lens}  local_kv_sum:{local_kv_sum}, qlen:{query_lens[i]}, tmp:{tmp}, pre_kv_sum:{pre_kv_sum}, kv_len:{kv_len}")
+        local_key[local_kv_sum:local_kv_sum+query_lens[i]] = key[tmp:pre_kv_sum]
+        local_val[local_kv_sum:local_kv_sum+query_lens[i]] = value[tmp:pre_kv_sum]
+    local_kv_sum += query_lens[i]
 
 # [[103, 123, 84, 239, 943, 30]]
 # print([l for kv_len in kv_lens for l in kv_len[::-1]])
@@ -189,6 +214,11 @@ flash_attn_varlen_func(
     chunk_rotray_offset_positions=rotray_offset_tensor,
     cu_num_chunks_k=cu_num_chunks_k,
     cos_sin_cache=cos_sin_cache,
+
+    local_key=local_key,
+    local_value=local_val,
+    local_cu_seqlen_k=cu_query_lens,
+
     out=output_chunk,
     fa_version=fa_version,
 )
