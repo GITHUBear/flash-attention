@@ -1083,12 +1083,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // ===================== Phase 2 for block attention ====================
     --chunk_info_idx;
+    // cos_sin_cache_stride
 
     for (; chunk_info_idx >= binfo.sum_chunked_seqlen_k; --chunk_info_idx) {
         if (params.actual_chunked_seqlen_k) {
             binfo.actual_seqlen_k = params.actual_chunked_seqlen_k[chunk_info_idx];
         }
         kvcache_global_row_offset -= (cute::ceil_div(binfo.actual_seqlen_k, params.page_block_size) * params.page_block_size);
+
+        // 获取 rotray 偏移
+        int chunk_rotary_offset = params.chunk_rotray_offset_positions ? params.chunk_rotray_offset_positions[chunk_info_idx] : 0;
 
         if (params.actual_chunked_seqlen_k) {
             debug_assert(n_split_idx == 0 && num_n_splits == 1 && !Is_local, "chunk mode does not support splitKV and local attention.");
@@ -1113,8 +1117,67 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
         // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
         // 将 K 分块拷贝到 smem
-        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                                    binfo.actual_seqlen_k - n_block * kBlockN);
+        // TODO[shk]: 施加 offset
+
+        if (chunk_rotary_offset != 0) {
+            typename Kernel_traits::GmemTiledCopyRotcossinContPaged gmem_tiled_copy_rotary_cont;
+            auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
+            Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.cos_sin_cache_ptr) + params.cos_sin_cache_stride * chunk_rotary_offset),
+                                        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                        make_stride(0, _1{}));
+            Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.cos_sin_cache_ptr) + (params.d / 2) + params.cos_sin_cache_stride * chunk_rotary_offset),
+                                        Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                        make_stride(0, _1{}));
+            Tensor tRgCosCont_ = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+            Tensor tRgSinCont_ = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+            Tensor tRgCosCont = make_tensor(tRgCosCont_.data(), reshape_flatten_thread_tile(tRgCosCont_.layout()));
+            Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
+            // if (cute::thread0()) {
+            //     printf("params.cos_sin_cache_stride:%ld, chunk_rotary_offset:%d\n",
+            //             params.cos_sin_cache_stride, chunk_rotary_offset);
+            //     printf("gCosCont: ");
+            //     print(gCosCont);
+            //     printf("\n");
+            //     printf("gSinCont: ");
+            //     print(gSinCont);
+            //     printf("\n");
+            //     printf("tRgCosCont_: ");
+            //     print(tRgCosCont_);
+            //     printf("\n");
+            //     printf("tRgSinCont_: ");
+            //     print(tRgSinCont_);
+            //     printf("\n");
+            //     printf("tRgCosCont: ");
+            //     print(tRgCosCont);
+            //     printf("\n");
+            //     printf("tRgSinCont: ");
+            //     print(tRgSinCont);
+            //     printf("\n");
+            //     printf("gK: ");
+            //     print(gK);
+            //     printf("\n");
+            //     printf("tKgK_: ");
+            //     print(tKgK_);
+            //     printf("\n");
+            //     printf("tKgK: ");
+            //     print(tKgK);
+            //     printf("\n");
+            // }
+            FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
+                tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
+                0, params.d, params.d
+            );
+            // if (cute::thread0()) {
+            //     printf("FIRST iter: binfo.actual_seqlen_k:%d, n_block:%d, chunk_offset:%d\n",
+            //             binfo.actual_seqlen_k, n_block, chunk_rotary_offset);
+            // }
+            // if (cute::thread0()) {
+            //     printf("################################\n");
+            // }
+        } else {
+            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                                        binfo.actual_seqlen_k - n_block * kBlockN);
+        }
         cute::cp_async_fence();
 
         // FLASH_NAMESPACE::cp_async_wait<0>();
@@ -1184,7 +1247,31 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                         block_table, params.k_batch_stride, params.k_row_stride,
                         page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);
                 }
-                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // TODO[shk]: 施加 offset
+                if (chunk_rotary_offset != 0) {
+                    typename Kernel_traits::GmemTiledCopyRotcossinContPaged gmem_tiled_copy_rotary_cont;
+                    auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
+                    Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.cos_sin_cache_ptr) + params.cos_sin_cache_stride * chunk_rotary_offset),
+                                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                                make_stride(0, _1{}));
+                    Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.cos_sin_cache_ptr) + (params.d / 2) + params.cos_sin_cache_stride * chunk_rotary_offset),
+                                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                                make_stride(0, _1{}));
+                    Tensor tRgCosCont_ = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+                    Tensor tRgSinCont_ = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+                    Tensor tRgCosCont = make_tensor(tRgCosCont_.data(), reshape_flatten_thread_tile(tRgCosCont_.layout()));
+                    Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
+                    FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
+                        tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, kBlockN,
+                        0, params.d, params.d
+                    );
+                    // if (cute::thread0()) {
+                    //     printf("SECOND iter: binfo.actual_seqlen_k:%d, n_block:%d, chunk_offset:%d\n",
+                    //             binfo.actual_seqlen_k, n_block, chunk_rotary_offset);
+                    // }
+                } else {
+                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+                }
                 // This cp_async_fence needs to be in the if block, otherwise the synchronization
                 // isn't right and we get race conditions.
                 cute::cp_async_fence();
@@ -1249,7 +1336,31 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                         block_table, params.k_batch_stride, params.k_row_stride,
                         page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);            
                 }
-                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // TODO[shk]: 施加 offset
+                if (chunk_rotary_offset != 0) {
+                    typename Kernel_traits::GmemTiledCopyRotcossinContPaged gmem_tiled_copy_rotary_cont;
+                    auto gmem_thr_copy_rotary_cont = gmem_tiled_copy_rotary_cont.get_thread_slice(tidx);
+                    Tensor gCosCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.cos_sin_cache_ptr) + params.cos_sin_cache_stride * chunk_rotary_offset),
+                                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                                make_stride(0, _1{}));
+                    Tensor gSinCont = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.cos_sin_cache_ptr) + (params.d / 2) + params.cos_sin_cache_stride * chunk_rotary_offset),
+                                                Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                                make_stride(0, _1{}));
+                    Tensor tRgCosCont_ = gmem_thr_copy_rotary_cont.partition_S(gCosCont);
+                    Tensor tRgSinCont_ = gmem_thr_copy_rotary_cont.partition_S(gSinCont);
+                    Tensor tRgCosCont = make_tensor(tRgCosCont_.data(), reshape_flatten_thread_tile(tRgCosCont_.layout()));
+                    Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
+                    FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
+                        tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, kBlockN,
+                        0, params.d, params.d
+                    );
+                    // if (cute::thread0()) {
+                    //     printf("THIRD iter: binfo.actual_seqlen_k:%d, n_block:%d, chunk_offset:%d\n",
+                    //             binfo.actual_seqlen_k, n_block, chunk_rotary_offset);
+                    // }
+                } else {
+                    FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+                }
                 // This cp_async_fence needs to be in the if block, otherwise the synchronization
                 // isn't right and we get race conditions.
                 cute::cp_async_fence();

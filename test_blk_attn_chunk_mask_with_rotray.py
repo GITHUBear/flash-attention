@@ -11,11 +11,19 @@ torch.cuda.manual_seed_all(0)
 def ceil_div(a, b):
     return (a + b - 1) // b
 
-# query_lens = [20, 10]
-query_lens = [1]
+query_lens = [20, 10]
+# query_lens = [1]
+# query_lens = [20]
 batch_size = len(query_lens)
-# kv_lens = [[103, 123, 84, 239, 943, 20],[800,31,10]]
-kv_lens = [[1,1]]
+kv_lens = [[103, 123, 84, 239, 943, 20],[800,31,10]]
+# kv_lens = [[1,1]]
+# kv_lens = [[103, 123, 84, 239, 943, 20]]
+# kv_lens = [[129, 20]]
+rotray_offsets = [[132,4,100,20, 1,0],[313, 1000, 0]]
+# rotray_offsets = [[132,4,100,20, 1,0]]
+# rotray_offsets = [[1,0]]
+flattened_rotray_offsets = [offset for rotray_offset in rotray_offsets for offset in rotray_offset]
+
 block_size = 16
 kv_lens_block_size_align = [[ceil_div(l, block_size)*block_size for l in kv_batch] for kv_batch in kv_lens]
 kv_blocks = [[ceil_div(l, block_size) for l in kv_batch] for kv_batch in kv_lens]
@@ -82,13 +90,44 @@ for i in range(batch_size):
     block_tables_cpu.append(block_table)
 print(f"block_table_cpu: {block_tables_cpu}")
 block_tables = torch.tensor(block_tables_cpu, dtype=torch.int32)
+rotray_offset_tensor = torch.tensor(flattened_rotray_offsets, dtype=torch.int32)
+
+# cos_sin_cache
+base = 1000000.0
+rotary_dim = 128
+max_position_embeddings = 4096
+inv_freq = 1.0 / (base**(torch.arange(
+            0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
+t = torch.arange(max_position_embeddings, dtype=torch.float)
+freqs = torch.einsum("i,j -> ij", t, inv_freq)
+cos = freqs.cos()
+sin = freqs.sin()
+cos_sin_cache = torch.cat((cos, sin), dim=-1).to(dtype=query.dtype)
+assert cos_sin_cache.stride(-1) == 1
+##############
+
+def apply_rotary_emb_torch(
+    x: torch.Tensor,
+    offset: int,
+) -> torch.Tensor:
+    cos_sin = cos_sin_cache[offset]
+    print(f"offset: {cos_sin}")
+    cos, sin = cos_sin.chunk(2, dim=-1)
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    o1 = x1 * cos - x2 * sin
+    o2 = x2 * cos + x1 * sin
+    return torch.cat((o1, o2), dim=-1)
 
 pre_kv_sum = 0
 for i in range(batch_size):
     pre_blk_cnt_sum = 0
-    for (kv_len, num_blk) in zip(kv_lens[i], num_blk_for_blk_attn[i]):
+    for (kv_len, num_blk, roffset) in zip(kv_lens[i], num_blk_for_blk_attn[i], rotray_offsets[i]):
         blocks = block_tables[i][pre_blk_cnt_sum:pre_blk_cnt_sum+num_blk]
-        key[pre_kv_sum:pre_kv_sum+kv_len] = (key_cache[blocks].reshape((-1, num_kv_heads, head_size)))[:kv_len]
+        if roffset != 0:
+            key_before_rotray = (key_cache[blocks].reshape((-1, num_kv_heads, head_size)))[:kv_len].clone()
+            key[pre_kv_sum:pre_kv_sum+kv_len] = apply_rotary_emb_torch(key_before_rotray, roffset)
+        else:
+            key[pre_kv_sum:pre_kv_sum+kv_len] = (key_cache[blocks].reshape((-1, num_kv_heads, head_size)))[:kv_len]
         value[pre_kv_sum:pre_kv_sum+kv_len] = (value_cache[blocks].reshape((-1, num_kv_heads, head_size)))[:kv_len]
 
         pre_kv_sum += kv_len
@@ -147,15 +186,17 @@ flash_attn_varlen_func(
     causal=True,
     block_table=block_tables,
     actual_chunked_seqlen_k=actual_chunked_seqlen_k,
+    chunk_rotray_offset_positions=rotray_offset_tensor,
     cu_num_chunks_k=cu_num_chunks_k,
+    cos_sin_cache=cos_sin_cache,
     out=output_chunk,
     fa_version=fa_version,
 )
 torch.cuda.synchronize()
 # print(output_chunk)
 
-print(output_common)
-print(output_chunk)
+# print(output_common)
+# print(output_chunk)
 print(torch.abs(output_common - output_chunk).max())
 # print(torch.allclose(output, output_tmp, atol=1e-3))
 

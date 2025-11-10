@@ -117,12 +117,26 @@ __forceinline__ __device__ void copy_rotary_contiguous(Tensor<Engine0, Layout0> 
                         const bool is_left = get<1>(identity_MN(0, 0, k)) < rotary_dim / 2;
                         Tensor gS_other = make_tensor(S(_, m, k).data() + (is_left ? rotary_dim / 2 : -rotary_dim / 2), S(_, m, k).layout());
                         cute::copy(gS_other, rS_other);
-                        // if (cute::thread0()) { print_tensor(rS(_, m, k)); print_tensor(rS_other); }
+                        // if (cute::thread0()) { 
+                        //     printf("rS: ");
+                        //     print_tensor(rS(_, m, k)); 
+                        //     printf("\n");
+                        //     printf("rS_other: ");
+                        //     print_tensor(rS_other); 
+                        //     printf("\n");
+                        // }
                         Tensor gCos = make_tensor(Cos(_, m, k).data() + (is_left ? 0 : -rotary_dim / 2), Cos(_, m, k).layout());
                         Tensor gSin = make_tensor(Sin(_, m, k).data() + (is_left ? 0 : -rotary_dim / 2), Sin(_, m, k).layout());
                         cute::copy(gCos, rCos(_, m, k));
                         cute::copy(gSin, rSin(_, m, k));
-                        // if (cute::thread0()) { print_tensor(rCos(_, m, k)); print_tensor(rSin(_, m, k)); }
+                        // if (cute::thread0()) {
+                        //     printf("rCos: ");
+                        //     print_tensor(rCos(_, m, k));
+                        //     printf("\n");
+                        //     printf("rSin: ");
+                        //     print_tensor(rSin(_, m, k)); 
+                        //     printf("\n");
+                        // }
                         Tensor S_fp32 = convert_type<float>(rS(_, m, k));
                         Tensor S_other_fp32 = convert_type<float>(rS_other);
                         Tensor cos_fp32 = convert_type<float>(rCos(_, m, k));
@@ -137,7 +151,11 @@ __forceinline__ __device__ void copy_rotary_contiguous(Tensor<Engine0, Layout0> 
                         using T = typename Engine0::value_type;
                         Tensor S_og_type = convert_type<T>(S_fp32_copy);
                         cute::copy(S_og_type, rS(_, m, k));
-                        // if (cute::thread0()) { print_tensor(rS(_, m, k)); }
+                        // if (cute::thread0()) {
+                        //     printf("rS: ");
+                        //     print_tensor(rS(_, m, k));
+                        //     printf("\n");
+                        // }
                     }
                     cute::copy(rS(_, m, k), D(_, m, k));
                 } else if (Clear_OOB_K) {

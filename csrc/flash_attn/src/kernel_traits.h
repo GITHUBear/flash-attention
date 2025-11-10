@@ -168,6 +168,10 @@ struct Flash_fwd_kernel_traits : public Base {
         make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
                         GmemLayoutAtomRotcossin{},
                         Layout<Shape < _1, _8>>{}));  // Val layout, 8 vals per load
+    using GmemTiledCopyRotcossinContVecPaged = decltype(
+        make_tiled_copy(Copy_Atom<AutoVectorizingCopyWithAssumedAlignment<128>, Element>{},
+                        GmemLayoutAtomRotcossin{},
+                        Layout<Shape<Int<kGmemRowsPerThread>, _8>, Stride<_8, _1>>{}));
     using GmemTiledCopyRotcossinPaged = decltype(
         make_tiled_copy(Copy_Atom<UniversalCopy<uint64_t>, Element>{},
                         GmemLayoutAtomRotcossin{},

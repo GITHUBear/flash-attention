@@ -146,6 +146,7 @@ def flash_attn_varlen_func(
     actual_chunked_seqlen_k: Optional[torch.Tensor] = None, # 倒序，如果为空，则每个 batch 默认分成一块，长度为 seqlen_k
     chunk_rotray_offset_positions: Optional[torch.Tensor] = None, # 倒序，如果为空，则默认无需修正位置编码
     cu_num_chunks_k: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
     ##
     return_softmax_lse=False,
     out=None,
@@ -225,6 +226,8 @@ def flash_attn_varlen_func(
         "cu_num_chunks_k must be provided if actual_chunked_seqlen_k is provided"
     assert chunk_rotray_offset_positions is None or cu_num_chunks_k is not None, \
         "cu_num_chunks_k must be provided if chunk_rotray_offset_positions is provided"
+    assert chunk_rotray_offset_positions is None or cos_sin_cache is not None, \
+        "cos_sin_cache must be provided if chunk_rotray_offset_positions is provided"
     
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
@@ -267,6 +270,7 @@ def flash_attn_varlen_func(
             actual_chunked_seqlen_k,
             chunk_rotray_offset_positions,
             cu_num_chunks_k,
+            cos_sin_cache,
             # 
             alibi_slopes,
             max_seqlen_q,

@@ -548,6 +548,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &actual_chunked_seqlen_k, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
                std::optional<at::Tensor> &chunk_rotray_offset_positions, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
                std::optional<at::Tensor> &cu_num_chunks_k,  // b+1
+               std::optional<at::Tensor> &cos_sin_cache,    // max_embedding_positions x head_size
             // 
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
@@ -740,6 +741,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_SHAPE(cu_num_chunks_k_, batch_size + 1);
     }
 
+    if (cos_sin_cache.has_value()) {
+        auto cos_sin_cache_ = cos_sin_cache.value();
+        TORCH_CHECK(cos_sin_cache_.dtype() == q_dtype, "cos_sin_cache must have the same dtype as query");
+        TORCH_CHECK(cos_sin_cache_.size(1) == head_size, "rotary dim must be head_size");
+        CHECK_CONTIGUOUS(cos_sin_cache_);
+        CHECK_DEVICE(cos_sin_cache_);
+    }
+
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -807,6 +816,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.actual_chunked_seqlen_k = actual_chunked_seqlen_k.has_value() ? static_cast<int *>(actual_chunked_seqlen_k.value().data_ptr()) : nullptr;
     params.chunk_rotray_offset_positions = chunk_rotray_offset_positions.has_value() ? static_cast<int *>(chunk_rotray_offset_positions.value().data_ptr()) : nullptr;
     params.cu_num_chunks_k = cu_num_chunks_k.has_value() ? static_cast<int *>(cu_num_chunks_k.value().data_ptr()) : nullptr;
+    params.cos_sin_cache_ptr = cos_sin_cache.has_value() ? cos_sin_cache.value().data_ptr() : nullptr;
+    params.cos_sin_cache_stride = cos_sin_cache.has_value() ? cos_sin_cache.value().stride(0) : 0;
     params.total_q = total_q;
 
     if (paged_KV) {

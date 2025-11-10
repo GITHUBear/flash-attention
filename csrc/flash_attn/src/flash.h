@@ -157,6 +157,8 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ actual_chunked_seqlen_k;
     int * __restrict__ chunk_rotray_offset_positions;
     int * __restrict__ cu_num_chunks_k;
+    void * __restrict__ cos_sin_cache_ptr;
+    index_t cos_sin_cache_stride;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
