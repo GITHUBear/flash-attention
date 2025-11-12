@@ -1093,6 +1093,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // 获取 rotray 偏移
         int chunk_rotary_offset = params.chunk_rotray_offset_positions ? params.chunk_rotray_offset_positions[chunk_info_idx] : 0;
+        const bool Is_Negative = (chunk_rotary_offset < 0);
+        if (Is_Negative) {
+            chunk_rotary_offset = -chunk_rotary_offset;
+        }
 
         if (params.actual_chunked_seqlen_k) {
             debug_assert(n_split_idx == 0 && num_n_splits == 1 && !Is_local, "chunk mode does not support splitKV and local attention.");
@@ -1165,7 +1169,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             // }
             FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
                 tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, binfo.actual_seqlen_k - n_block * kBlockN,
-                0, params.d, params.d
+                0, params.d, params.d, Is_Negative
             );
             // if (cute::thread0()) {
             //     printf("FIRST iter: binfo.actual_seqlen_k:%d, n_block:%d, chunk_offset:%d\n",
@@ -1263,7 +1267,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                     Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
                     FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
                         tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, kBlockN,
-                        0, params.d, params.d
+                        0, params.d, params.d, Is_Negative
                     );
                     // if (cute::thread0()) {
                     //     printf("SECOND iter: binfo.actual_seqlen_k:%d, n_block:%d, chunk_offset:%d\n",
@@ -1352,7 +1356,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
                     Tensor tRgSinCont = make_tensor(tRgSinCont_.data(), reshape_flatten_thread_tile(tRgSinCont_.layout()));
                     FLASH_NAMESPACE::copy_rotary_contiguous<Is_even_K, /*Clear_OOB_K=*/false>(
                         tKgK, tKsK, tRgCosCont, tRgSinCont, tKVcKV, kBlockN,
-                        0, params.d, params.d
+                        0, params.d, params.d, Is_Negative
                     );
                     // if (cute::thread0()) {
                     //     printf("THIRD iter: binfo.actual_seqlen_k:%d, n_block:%d, chunk_offset:%d\n",

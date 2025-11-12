@@ -89,7 +89,8 @@ __forceinline__ __device__ void copy_rotary_contiguous(Tensor<Engine0, Layout0> 
                                               Tensor<Engine2, Layout2> const &Sin,
                                               Tensor<Engine3, Layout3> const &identity_MN,
                                               const int max_MN, const int min_MN,
-                                              const int dim, const int rotary_dim) {
+                                              const int dim, const int rotary_dim,
+                                              const bool Is_Negative = false) {
     CUTE_STATIC_ASSERT_V(rank(S) == Int<3>{});
     CUTE_STATIC_ASSERT_V(rank(D) == Int<3>{});
     CUTE_STATIC_ASSERT_V(size<0>(S) == size<0>(D));                     // MMA
@@ -143,7 +144,7 @@ __forceinline__ __device__ void copy_rotary_contiguous(Tensor<Engine0, Layout0> 
                         Tensor sin_fp32 = convert_type<float>(rSin(_, m, k));
                         #pragma unroll
                         for (int i = 0; i < size<0>(rS); ++i) {
-                            S_fp32(i) = S_fp32(i) * cos_fp32(i) + S_other_fp32(i) * (is_left ? -sin_fp32(i) : sin_fp32(i));
+                            S_fp32(i) = S_fp32(i) * cos_fp32(i) + S_other_fp32(i) * (is_left ? -sin_fp32(i) : sin_fp32(i)) * (Is_Negative ? -1 : 1);
                         }
                         // Idk but I need to copy for the convert_type to work
                         Tensor S_fp32_copy = make_fragment_like(S_fp32);
