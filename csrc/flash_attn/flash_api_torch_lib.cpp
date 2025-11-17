@@ -36,6 +36,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &chunk_rotray_offset_positions, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
                std::optional<at::Tensor> &cu_num_chunks_k,  // b+1
                std::optional<at::Tensor> &cos_sin_cache,    // max_embedding_positions x head_size
+               const bool enable_splitkv_for_chunked_kv,
 
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
@@ -127,7 +128,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
             "Tensor cu_seqlens_k, Tensor? batch_idx_offset_for_blk_attn, Tensor? seqused_k, Tensor? leftpad_k, "
             "Tensor? block_table, Tensor? page_compress_cache, Tensor? page_compress_cache_ids, "
             "Tensor? num_compressed_pages, Tensor? local_key, Tensor? local_value, Tensor? local_cu_seqlen_k, "
-            "Tensor? actual_chunked_seqlen_k, Tensor? chunk_rotray_offset_positions, Tensor? cu_num_chunks_k, Tensor? cos_sin_cache, Tensor? alibi_slopes, "
+            "Tensor? actual_chunked_seqlen_k, Tensor? chunk_rotray_offset_positions, Tensor? cu_num_chunks_k, Tensor? cos_sin_cache, "
+            "bool enable_splitkv_for_chunked_kv, Tensor? alibi_slopes, "
             "int max_seqlen_q, int max_seqlen_k, float p_dropout, float softmax_scale, bool zero_tensors, "
             "bool is_causal, int window_size_left, int window_size_right, float softcap, bool return_softmax, "
             "Generator? gen) -> Tensor[]");

@@ -11,22 +11,27 @@ torch.cuda.manual_seed_all(0)
 def ceil_div(a, b):
     return (a + b - 1) // b
 
-query_lens = [30, 30, 30, 20, 100, 100, 10, 50]
+# query_lens = [30, 30, 30, 20, 100, 100, 10, 50]
 # query_lens = [41, 976, 275, 2418, 2090, 1261, 167, 1516, 1977, 384, 597, 52]
 # query_lens = [48, 976, 288, 2432, 2096, 1264, 176, 1520, 1984, 384, 608, 252]
 # query_lens = [1]
-# query_lens = [20]
+query_lens = [1, 1]
+
 batch_size = len(query_lens)
-kv_lens = [[30], [30], [30], [103, 123, 84, 239, 943, 20], [100], [100], [800,31,10], [150]]
+
+# kv_lens = [[30], [30], [30], [103, 123, 84, 239, 943, 20], [100], [100], [800,31,10], [150]]
 # kv_lens = [[41], [976], [275], [2418], [2090], [1261], [167], [1516], [1977], [384], [597], [41, 976, 275, 2418, 2090, 1261, 167, 1516, 1977, 384, 597, 52]]
 # kv_lens = [[48], [976], [288], [2432], [2096], [1264], [176], [1520], [1984], [384], [608], [41, 976, 275, 2418, 2090, 1261, 167, 1516, 1977, 384, 597, 252]]
 # kv_lens = [[100,10]]
-# kv_lens = [[103, 123, 84, 239, 943, 20]]
-# kv_lens = [[129, 20]]
-rotray_offsets = [[0], [0], [0], [132,-4,100,-20, -1,0], [0], [0], [-313, -1000, 0], [0]]
+# kv_lens = [[103, 123, 84, 239, 943, 20], [10000, 1000]]
+kv_lens = [[10, 12, 40, 239, 10000, 20], [10, 1000]]
+# kv_lens = [[10000, 1000]]
+
+# rotray_offsets = [[0], [0], [0], [132,-4,100,-20, -1,0], [0], [0], [-313, -1000, 0], [0]]
 # rotray_offsets = [[0], [0], [0], [0], [0], [0], [0], [0], [0], [0], [0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]
-# rotray_offsets = [[132,4,100,20, 1,0]]
-# rotray_offsets = [[10,0]]
+rotray_offsets = [[132,-4,-100,20, -1,0], [10, 0]]
+# rotray_offsets = [[10, 0]]
+
 flattened_rotray_offsets = [offset for rotray_offset in rotray_offsets for offset in rotray_offset]
 batch_is_local = []
 for kv_len, q_len, rot_offset in zip(kv_lens, query_lens, rotray_offsets):
@@ -224,6 +229,7 @@ flash_attn_varlen_func(
     chunk_rotray_offset_positions=rotray_offset_tensor,
     cu_num_chunks_k=cu_num_chunks_k,
     cos_sin_cache=cos_sin_cache,
+    enable_splitkv_for_chunked_kv=True,
 
     local_key=local_key,
     local_value=local_val,

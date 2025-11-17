@@ -508,7 +508,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
-inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
+// 由于 n_split_idx 在 chunked attention 情况，会修改 n_split_idx，这里去掉 const
+inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -537,16 +538,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     // if (threadIdx.x == 0 && blockIdx.y == 1 && blockIdx.z == 0) { printf("params.knew_ptr = %p, seqlen_k_cache + seqlen_knew = %d\n", params.knew_ptr, binfo.seqlen_k_cache + (params.knew_ptr == nullptr ? 0 : params.seqlen_knew)); }
     if (m_block * kBlockM >= binfo.actual_seqlen_q) return;
 
-    const int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    int n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+    // 为了防止每个 chunk 内分配 split 的方式可能导致负载不均衡的问题，每段 chunk 的 split_id 在移动到下一个 chunk 时会 +1 取模
+    // 这样可以令每个 chunk 的相同偏移位置被不同的 Thread Block 处理，这在 chunk 数量多但长度较短时能够更好地平均负载，防止退化到单 Thread Block 处理
     int n_block_min = !Is_local
         ? n_split_idx * n_blocks_per_split
         : std::max(n_split_idx * n_blocks_per_split, (m_block * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left) / kBlockN);
     int n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
     if (Is_causal || Is_local) {
+        // 如果是 casual 模式，那么需要根据当前的 Q 的位置计算最大的 blockN
         n_block_max = std::min(n_block_max,
                                cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
     }
-    if (n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
+    // chunked attention 情况延后边界条件的处理
+    if (params.actual_chunked_seqlen_k == nullptr && n_block_min >= n_block_max) {  // This also covers the case where n_block_max <= 0
         // We exit early and write 0 to gOaccum and -inf to gLSEaccum.
         // Otherwise we might read OOB elements from gK and gV,
         // or get wrong results when we combine gOaccum from different blocks.
@@ -899,6 +904,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     int chunk_info_idx = params.cu_num_chunks_k ? params.cu_num_chunks_k[bidb + 1] - 1 : 0;
     int kvcache_global_row_offset = cute::ceil_div(binfo.actual_seqlen_k, params.page_block_size) * params.page_block_size;
+    bool kv_split_all_empty = true;
 
     if (params.actual_chunked_seqlen_k) {
         binfo.actual_seqlen_k = params.actual_chunked_seqlen_k[chunk_info_idx];
@@ -906,179 +912,186 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     kvcache_global_row_offset -= (cute::ceil_div(binfo.actual_seqlen_k, params.page_block_size) * params.page_block_size);
 
     if (params.actual_chunked_seqlen_k) {
-        debug_assert(n_split_idx == 0 && num_n_splits == 1 && !Is_local, "chunk mode does not support splitKV and local attention.");
-        n_block_min = 0;
+        // 目前是基于 actual_chunked_seqlen_k 来按序处理的，
+        // 在开启 splitKV 时需要重新
+        debug_assert(!Is_local, "chunk mode does not support local attention.");
+        n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+        n_block_min = n_split_idx * n_blocks_per_split;
         n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
         if (Is_causal) {
             n_block_max = std::min(n_block_max,
                                 cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
         }
-        debug_assert(n_block_max > n_block_min, "n_block_max <= n_block_min");
+        n_split_idx = (n_split_idx + 1) % num_n_splits;
+        // debug_assert(n_block_max > n_block_min, "n_block_max <= n_block_min");
     }
 
-    int n_block = n_block_max - 1;
-    if (block_table != nullptr) {
-        auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
-        tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
-            block_table, params.k_batch_stride, params.k_row_stride,
-            page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset, final_block_size);
-        tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
-            block_table, params.v_batch_stride, params.v_row_stride,
-            page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset, final_block_size);
-    }
-    // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
-    // 将 K 分块拷贝到 smem
-    FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
-                                                binfo.actual_seqlen_k - n_block * kBlockN);
-    cute::cp_async_fence();
+    if (n_block_max > n_block_min) {
+        int n_block = n_block_max - 1;
+        if (block_table != nullptr) {
+            auto final_block_size = binfo.actual_seqlen_k - (n_block_max - 1) * kBlockN;
+            tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+                block_table, params.k_batch_stride, params.k_row_stride,
+                page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset, final_block_size);
+            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block_max - 1, params.page_block_size,
+                block_table, params.v_batch_stride, params.v_row_stride,
+                page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset, final_block_size);
+        }
+        // We don't need to clear the sK smem tiles since we'll mask out the scores anyway.
+        // 将 K 分块拷贝到 smem
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV,
+                                                    binfo.actual_seqlen_k - n_block * kBlockN);
+        cute::cp_async_fence();
 
-    // FLASH_NAMESPACE::cp_async_wait<0>();
-    // __syncthreads();
-    // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tKsK); }
-    // __syncthreads();
+        // FLASH_NAMESPACE::cp_async_wait<0>();
+        // __syncthreads();
+        // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tKsK); }
+        // __syncthreads();
 
-    FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
+        FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
 
-    #pragma unroll
-    for (int masking_step = 0; masking_step < n_masking_steps_phase_1; ++masking_step, --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-        clear(acc_s);
-        // 等待异步的 Q/K 拷贝完成
-        FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
+        #pragma unroll
+        for (int masking_step = 0; masking_step < n_masking_steps_phase_1; ++masking_step, --n_block) {
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+            clear(acc_s);
+            // 等待异步的 Q/K 拷贝完成
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
 
-        // Advance gV
-        if (masking_step > 0) {
+            // Advance gV
+            if (masking_step > 0) {
+                if (block_table == nullptr) {
+                    // 下一个 kBlockN
+                    tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
+                } else {
+                    tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
+                        block_table, params.v_batch_stride, params.v_row_stride,
+                        page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);
+                }
+                // 异步拷贝 V 到 smem
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
+            } else {
+                // 拷贝 V
+                // Clear the smem tiles to account for predicated off loads
+                FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
+                    gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+                );
+            }
+            cute::cp_async_fence();
+
+            // sK 拷贝到寄存器 rK， sQ 拷贝到寄存器 rQ 计算 acc_s = tSrQ * tSrK
+            FLASH_NAMESPACE::gemm(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
+            );
+            // if (cute::thread0()) { print(acc_s); }
+            if constexpr (Is_softcap){
+                FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+            }
+
+            // (tidx / 32) * 16 + (tidx % 32) / 4
+            mask.template apply_mask<Is_causal, Is_even_MN>(
+                acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            );
+
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+            // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tVsV); }
+            // __syncthreads();
+
+            if (n_block > n_block_min) {
+                // Advance gK
+                if (block_table == nullptr) {
+                    // 拷贝下一个 K tile
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                        block_table, params.k_batch_stride, params.k_row_stride,
+                        page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
+            }
+
+            // We have key_padding_mask so we'll need to Check_inf
+            masking_step == 0
+                ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
+            // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
+
+            // Convert acc_s from fp32 to fp16/bf16
+            Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+            // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+            // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+
+            // This check is at the end of the loop since we always have at least 1 iteration
+            if (n_masking_steps_phase_1 > 1 && n_block <= n_block_min) {
+                --n_block;
+                break;
+            }
+        }
+
+        // These are the iterations where we don't need masking on S
+        for (; n_block >= n_block_min; --n_block) {
+            Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
+            clear(acc_s);
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+            // Advance gV
             if (block_table == nullptr) {
-                // 下一个 kBlockN
                 tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
             } else {
-                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size,
+                tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
                     block_table, params.v_batch_stride, params.v_row_stride,
                     page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);
             }
-            // 异步拷贝 V 到 smem
+
             FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
-        } else {
-            // 拷贝 V
-            // Clear the smem tiles to account for predicated off loads
-            FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/true>(
-                gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV, binfo.actual_seqlen_k - n_block * kBlockN
+            cute::cp_async_fence();
+
+            FLASH_NAMESPACE::gemm(
+                acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+                smem_thr_copy_Q, smem_thr_copy_K
             );
-        }
-        cute::cp_async_fence();
-
-        // sK 拷贝到寄存器 rK， sQ 拷贝到寄存器 rQ 计算 acc_s = tSrQ * tSrK
-        FLASH_NAMESPACE::gemm(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
-        // if (cute::thread0()) { print(acc_s); }
-        if constexpr (Is_softcap){
-            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
-        }
-
-        // (tidx / 32) * 16 + (tidx % 32) / 4
-        mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-        );
-
-        FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
-        // if (tidx == 0 && blockIdx.y == 0 && blockIdx.z == 0) { print(tVsV); }
-        // __syncthreads();
-
-        if (n_block > n_block_min) {
-            // Advance gK
-            if (block_table == nullptr) {
-                // 拷贝下一个 K tile
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            } else {
-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
-                    block_table, params.k_batch_stride, params.k_row_stride,
-                    page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);
+            if constexpr (Is_softcap){
+                FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
-        }
 
-        // We have key_padding_mask so we'll need to Check_inf
-        masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
-            : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
-        // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
-
-        // Convert acc_s from fp32 to fp16/bf16
-        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
-        // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-        // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
-        Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-
-        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-
-        // This check is at the end of the loop since we always have at least 1 iteration
-        if (n_masking_steps_phase_1 > 1 && n_block <= n_block_min) {
-            --n_block;
-            break;
-        }
-    }
-
-    // These are the iterations where we don't need masking on S
-    for (; n_block >= n_block_min; --n_block) {
-        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
-        clear(acc_s);
-        FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
-        // Advance gV
-        if (block_table == nullptr) {
-            tVgV.data() = tVgV.data() + (-int(kBlockN * params.v_row_stride));
-        } else {
-            tVgV.data() = gV.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block, params.page_block_size, 
-                block_table, params.v_batch_stride, params.v_row_stride,
-                page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);
-        }
-
-        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tVgV, tVsV, tKVcKV, tKVpKV);
-        cute::cp_async_fence();
-
-        FLASH_NAMESPACE::gemm(
-            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
-            smem_thr_copy_Q, smem_thr_copy_K
-        );
-        if constexpr (Is_softcap){
-            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
-        }
-
-        FLASH_NAMESPACE::cp_async_wait<0>();
-        __syncthreads();
-        if (n_block > n_block_min) {
-            // Advance gK
-            if (block_table == nullptr) {
-                tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
-            } else {
-                tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
-                    block_table, params.k_batch_stride, params.k_row_stride,
-                    page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);            
+            FLASH_NAMESPACE::cp_async_wait<0>();
+            __syncthreads();
+            if (n_block > n_block_min) {
+                // Advance gK
+                if (block_table == nullptr) {
+                    tKgK.data() = tKgK.data() + (-int(kBlockN * params.k_row_stride));
+                } else {
+                    tKgK.data() = gK.data() + flash::resolve_thread_kv_page_slice_offset<Kernel_traits>(tidx, n_block - 1, params.page_block_size, 
+                        block_table, params.k_batch_stride, params.k_row_stride,
+                        page_compress_cache, params.page_compress_topk, num_compressed_page, kvcache_global_row_offset);            
+                }
+                FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
+                // This cp_async_fence needs to be in the if block, otherwise the synchronization
+                // isn't right and we get race conditions.
+                cute::cp_async_fence();
             }
-            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_KV, tKgK, tKsK, tKVcKV, tKVpKV);
-            // This cp_async_fence needs to be in the if block, otherwise the synchronization
-            // isn't right and we get race conditions.
-            cute::cp_async_fence();
+
+            mask.template apply_mask</*Causal_mask=*/false>(
+                acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            );
+            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+
+            Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+            // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+            // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
+            Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
+
+            FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         }
-
-        mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
-        );
-        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
-
-        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
-        // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-        // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
-        Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-
-        FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+        kv_split_all_empty = false;
     }
 
     // ===================== Phase 2 for block attention ====================
@@ -1099,14 +1112,20 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
 
         if (params.actual_chunked_seqlen_k) {
-            debug_assert(n_split_idx == 0 && num_n_splits == 1 && !Is_local, "chunk mode does not support splitKV and local attention.");
-            n_block_min = 0;
+            debug_assert(!Is_local, "chunk mode does not support local attention.");
+            n_blocks_per_split = ((binfo.actual_seqlen_k + kBlockN - 1) / kBlockN + num_n_splits - 1) / num_n_splits;
+            n_block_min = n_split_idx * n_blocks_per_split;
             n_block_max = std::min(cute::ceil_div(binfo.actual_seqlen_k, kBlockN), (n_split_idx + 1) * n_blocks_per_split);
             // if (Is_causal) {
             //     n_block_max = std::min(n_block_max,
             //                         cute::ceil_div((m_block + 1) * kBlockM + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right, kBlockN));
             // }
-            debug_assert(n_block_max > n_block_min, "n_block_max <= n_block_min");
+            n_split_idx = (n_split_idx + 1) % num_n_splits;
+            // debug_assert(n_block_max > n_block_min, "n_block_max <= n_block_min");
+        }
+        
+        if (n_block_max <= n_block_min) {
+            continue;
         }
 
         int n_block = n_block_max - 1;
@@ -1285,7 +1304,9 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             // masking_step == 0 && chunk_info_idx == max_chunk_info_idx
             //     ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
             //     : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
-            softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/false || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
+            kv_split_all_empty ? 
+                softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/false || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
+                : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/false || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
             // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
 
             // Convert acc_s from fp32 to fp16/bf16
@@ -1382,6 +1403,45 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
             FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
         }
+        kv_split_all_empty = false;
+    }
+
+    if (params.actual_chunked_seqlen_k != nullptr && kv_split_all_empty) {
+        const index_t row_offset_o = binfo.q_offset(params.o_batch_stride, params.o_row_stride, bidb)
+            + m_block * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
+        const index_t row_offset_oaccum = (((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q
+            + m_block * kBlockM) * params.d_rounded;
+        const index_t row_offset_lseaccum = ((n_split_idx * params.b + bidb) * params.h + bidh) * params.seqlen_q + m_block * kBlockM;
+        Tensor gOaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementO *>(Split ? params.oaccum_ptr : params.o_ptr) + (Split ? row_offset_oaccum : row_offset_o)),
+                                      Shape<Int<kBlockM>, Int<kHeadDim>>{},
+                                     make_stride(Split ? kHeadDim : params.o_row_stride, _1{}));
+        Tensor gLSEaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum *>(Split ? params.softmax_lseaccum_ptr : params.softmax_lse_ptr) + row_offset_lseaccum),
+                                      Shape<Int<kBlockM>>{}, Stride<_1>{});
+
+        GmemTiledCopyO gmem_tiled_copy_Oaccum;
+        auto gmem_thr_copy_Oaccum = gmem_tiled_copy_Oaccum.get_thread_slice(tidx);
+        Tensor tOgOaccum = gmem_thr_copy_Oaccum.partition_D(gOaccum);
+        Tensor tOrOaccum = make_tensor<ElementO>(shape(tOgOaccum));
+        clear(tOrOaccum);
+        // Construct identity layout for sO
+        Tensor cO = make_identity_tensor(make_shape(size<0>(gOaccum), size<1>(gOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
+        // Repeat the partitioning with identity layouts
+        Tensor tOcO = gmem_thr_copy_Oaccum.partition_D(cO);
+        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOgOaccum)));
+        if (!Is_even_K) {
+            #pragma unroll
+            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(0, 0, k)) < params.d; }
+        }
+        // Clear_OOB_K must be false since we don't want to write zeros to gmem
+        FLASH_NAMESPACE::copy<Is_even_MN, Is_even_K, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+            gmem_tiled_copy_Oaccum, tOrOaccum, tOgOaccum, tOcO, tOpO, binfo.actual_seqlen_q - m_block * kBlockM
+        );
+        #pragma unroll
+        for (int m = 0; m < size<1>(tOgOaccum); ++m) {
+            const int row = get<0>(tOcO(0, m, 0));
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSEaccum(row) = Split ? -INFINITY : INFINITY; }
+        }
+        return;
     }
 
     // Epilogue

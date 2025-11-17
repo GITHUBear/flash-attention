@@ -164,6 +164,7 @@ void set_params_fprop(Flash_fwd_params &params,
     params.local_k_ptr = local_key_d;
     params.local_v_ptr = local_value_d;
     params.local_cu_seqlen_k = static_cast<int *>(local_cu_seqlen_k);
+    params.enable_splitkv_for_chunked_kv = false;
 }
 
 void set_params_dgrad(Flash_bwd_params &params,
@@ -322,12 +323,12 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     if (p_dropout == 0.0f) {  // SplitKV is not implemented for dropout
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
-            if (params.actual_chunked_seqlen_k != nullptr) {
+            if (params.actual_chunked_seqlen_k != nullptr && !params.enable_splitkv_for_chunked_kv) {
                 // 设置分块 block attention 时，暂时不开启 splitKV 特性
-                // TODO[shk]:待优化
                 params.num_splits = 0;
             } else {
                 params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+                // printf("========== SPLITKV: num_splits:%d num_n_blocks:%d =============\n", params.num_splits, num_n_blocks);
             }
         }
         if (params.num_splits > 1) {
@@ -549,6 +550,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &chunk_rotray_offset_positions, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
                std::optional<at::Tensor> &cu_num_chunks_k,  // b+1
                std::optional<at::Tensor> &cos_sin_cache,    // max_embedding_positions x head_size
+               const bool enable_splitkv_for_chunked_kv,
             // 
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
                int max_seqlen_q,
@@ -818,6 +820,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.cu_num_chunks_k = cu_num_chunks_k.has_value() ? static_cast<int *>(cu_num_chunks_k.value().data_ptr()) : nullptr;
     params.cos_sin_cache_ptr = cos_sin_cache.has_value() ? cos_sin_cache.value().data_ptr() : nullptr;
     params.cos_sin_cache_stride = cos_sin_cache.has_value() ? cos_sin_cache.value().stride(0) : 0;
+    params.enable_splitkv_for_chunked_kv = enable_splitkv_for_chunked_kv;
     params.total_q = total_q;
 
     if (paged_KV) {
