@@ -598,7 +598,10 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // We move K and V to the last block.
     const int bidb_cache = params.cache_batch_idx == nullptr ? bidb : params.cache_batch_idx[bidb];
-    const int *block_table = (params.block_table == nullptr || binfo.force_use_local_kv) ? nullptr : params.block_table + bidb * params.block_table_batch_stride;
+    const int *block_table = (params.block_table == nullptr || binfo.force_use_local_kv) ? nullptr :  
+                              (params.block_table_offsets_ptr == nullptr ?
+                               params.block_table + bidb * params.block_table_batch_stride :
+                               params.block_table + params.block_table_offsets_ptr[bidb]);
     const int page_compress_cache_id = params.page_compress_cache_ids == nullptr ? -1 : (params.page_compress_cache_ids)[bidb];
     const int num_compressed_page = params.num_compressed_pages == nullptr ? -1 : (params.num_compressed_pages)[bidb];
     const int *page_compress_cache = params.page_compress_cache == nullptr ? nullptr : 

@@ -147,6 +147,7 @@ def flash_attn_varlen_func(
     chunk_rotray_offset_positions: Optional[torch.Tensor] = None, # 倒序，如果为空，则默认无需修正位置编码
     cu_num_chunks_k: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
+    block_table_offsets: Optional[torch.Tensor] = None,
     enable_splitkv_for_chunked_kv: bool = False,
     ##
     return_softmax_lse=False,
@@ -272,6 +273,7 @@ def flash_attn_varlen_func(
             chunk_rotray_offset_positions,
             cu_num_chunks_k,
             cos_sin_cache,
+            block_table_offsets,
             enable_splitkv_for_chunked_kv,
             # 
             alibi_slopes,

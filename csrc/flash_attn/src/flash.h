@@ -159,6 +159,7 @@ struct Flash_fwd_params : public Qkv_params {
     int * __restrict__ cu_num_chunks_k;
     void * __restrict__ cos_sin_cache_ptr;
     index_t cos_sin_cache_stride;
+    int * __restrict__ block_table_offsets_ptr;
     bool enable_splitkv_for_chunked_kv;
 };
 

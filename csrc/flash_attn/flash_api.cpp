@@ -550,6 +550,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                std::optional<at::Tensor> &chunk_rotray_offset_positions, // total_chunks, total_chunks := \sum_{i=0}^{b} num_chunks
                std::optional<at::Tensor> &cu_num_chunks_k,  // b+1
                std::optional<at::Tensor> &cos_sin_cache,    // max_embedding_positions x head_size
+               std::optional<at::Tensor> &block_table_offsets,  // b
                const bool enable_splitkv_for_chunked_kv,
             // 
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
@@ -751,6 +752,14 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         CHECK_DEVICE(cos_sin_cache_);
     }
 
+    if (block_table_offsets.has_value()) {
+        auto block_table_offsets_ = block_table_offsets.value();
+        TORCH_CHECK(block_table_offsets_.dtype() == torch::kInt32, "block_table_offsets must have dtype int32");
+        TORCH_CHECK(block_table_offsets_.is_cuda(), "block_table_offsets must be on CUDA device");
+        TORCH_CHECK(block_table_offsets_.is_contiguous(), "block_table_offsets must be contiguous");
+        CHECK_SHAPE(block_table_offsets_, batch_size);
+    }
+
     at::Tensor out;
     if (out_.has_value()) {
         out = out_.value();
@@ -820,6 +829,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.cu_num_chunks_k = cu_num_chunks_k.has_value() ? static_cast<int *>(cu_num_chunks_k.value().data_ptr()) : nullptr;
     params.cos_sin_cache_ptr = cos_sin_cache.has_value() ? cos_sin_cache.value().data_ptr() : nullptr;
     params.cos_sin_cache_stride = cos_sin_cache.has_value() ? cos_sin_cache.value().stride(0) : 0;
+    params.block_table_offsets_ptr = block_table_offsets.has_value() ? static_cast<int *>(block_table_offsets.value().data_ptr()) : nullptr;
     params.enable_splitkv_for_chunked_kv = enable_splitkv_for_chunked_kv;
     params.total_q = total_q;
 
